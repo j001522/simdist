@@ -339,7 +339,14 @@ def material_properties(env: ManagerBasedRLEnv):
     if event_func is None:
         raise RuntimeError("No event found for material properties")
 
-    return event_func.assigned_material
+    # `assigned_material` is only set after the startup event has run; IsaacLab
+    # probes observation dims by calling this term during env __init__ (before
+    # any event executes), so fall back to a correctly-shaped zero tensor.
+    return getattr(
+        event_func,
+        "assigned_material",
+        torch.zeros(env.num_envs, 3, device=env.device),
+    )
 
 
 def desired_contacts(
