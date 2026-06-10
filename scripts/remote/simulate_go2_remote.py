@@ -24,28 +24,32 @@ sys.path.insert(0, _HERE)
 import ipc  # noqa: E402
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--mppi-host", default="127.0.0.1")
-    parser.add_argument("--mppi-port", type=int, default=5599)
-    args, unknown = parser.parse_known_args()
-    sys.argv = [sys.argv[0]] + unknown  # keep only unknown args for hydra
-    return args
-
-
-args = parse_args()
-
 from isaaclab.app import AppLauncher  # noqa: E402
 
-app_launcher = AppLauncher(headless=args.headless)
+parser = argparse.ArgumentParser()
+parser.add_argument("--mppi-host", default="127.0.0.1")
+parser.add_argument("--mppi-port", type=int, default=5599)
+parser.add_argument("--video", action="store_true",
+                    help="Record a video offscreen (works headless / no display).")
+parser.add_argument("--video_length", type=int, default=200,
+                    help="Number of steps to record.")
+parser.add_argument("--video_dir", default=None,
+                    help="Output dir for videos (default: <cwd>/videos).")
+# adds --headless, --enable_cameras, --device, etc.
+AppLauncher.add_app_launcher_args(parser)
+args, unknown = parser.parse_known_args()
+sys.argv = [sys.argv[0]] + unknown  # keep only unknown args for hydra
+if args.video:
+    args.enable_cameras = True  # offscreen rendering needs cameras
+
+app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
 import hydra  # noqa: E402
 from omegaconf import DictConfig, OmegaConf  # noqa: E402
 import numpy as np  # noqa: E402
+import gymnasium as gym  # noqa: E402
 from tqdm import tqdm  # noqa: E402
-from datetime import datetime  # noqa: E402
 import torch  # noqa: E402
 from isaaclab.envs import ManagerBasedRLEnv  # noqa: E402
 
@@ -147,9 +151,23 @@ class Go2Sim:
         mass = cfg["sim"]["add_mass"]
         env_cfg.events.add_base_mass.params["mass_distribution_params"] = (mass, mass)
 
-        # create the env
-        self.env = ManagerBasedRLEnv(env_cfg)
-        self.cmd_manager = self.env.command_manager
+        # create the env (offscreen render + RecordVideo wrapper if --video)
+        render_mode = "rgb_array" if args.video else None
+        self.raw_env = ManagerBasedRLEnv(env_cfg, render_mode=render_mode)
+        self.env = self.raw_env
+        if args.video:
+            vdir = args.video_dir or os.path.join(os.getcwd(), "videos")
+            os.makedirs(vdir, exist_ok=True)
+            self.env = gym.wrappers.RecordVideo(
+                self.raw_env,
+                video_folder=vdir,
+                step_trigger=lambda s: s == 0,
+                video_length=args.video_length,
+                disable_logger=True,
+            )
+            print(f"[video] recording {args.video_length} steps to {vdir}",
+                  flush=True)
+        self.cmd_manager = self.raw_env.command_manager
         self.obs_dict, _ = self.env.reset()
         proprio_obs, height_scan = self.get_obs(self.obs_dict)
 
@@ -234,7 +252,8 @@ class Go2Sim:
         return reset[0]
 
     def action_to_torch(self, action):
-        return torch.from_numpy(np.asarray(action)).unsqueeze(0).to(self.env.device)
+        return torch.from_numpy(np.asarray(action)).unsqueeze(0).to(
+            self.raw_env.device)
 
     def reset(self):
         self.episode_terminated = True

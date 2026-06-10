@@ -5,8 +5,11 @@
 # They talk over a localhost socket (see ipc.py). Required because the numpy ABI
 # wall prevents JAX (numpy>=2) and IsaacLab (numpy<2) from sharing one Python.
 #
-# Usage:  ./run.sh [hydra overrides / --headless]
-# Env:    PORT (default 5599), CKPT (default the bundled go2 checkpoint)
+# Usage:  ./run.sh [--headless] [--video --video_length N] [hydra overrides]
+#   No display? record offscreen, e.g.:
+#     ./run.sh --headless --video --video_length 300
+#   Video is written to <cwd>/videos/rl-video-step-0.mp4 (override --video_dir).
+# Env:    PORT (default 5599)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
