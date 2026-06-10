@@ -45,7 +45,8 @@ def _install_stubs() -> None:
     sys.modules["simdist.data.dataset"] = ds
 
 
-def build_controller(simdist_dir: str, ckpt_dir: str, ctrl_cfg: dict):
+def build_controller(simdist_dir: str, ckpt_dir: str, ctrl_cfg: dict,
+                     restore: bool = True):
     sys.path.insert(0, simdist_dir)
     import flax.nnx as nnx
     from omegaconf import OmegaConf
@@ -54,12 +55,20 @@ def build_controller(simdist_dir: str, ckpt_dir: str, ctrl_cfg: dict):
     from simdist.utils import model as mu, paths
     from simdist.control.mppi import MppiController
 
-    model_cfg = OmegaConf.to_container(
-        OmegaConf.load(os.path.join(ckpt_dir, paths.get_model_config_filename())),
-        resolve=True,
-    )
-    model = models.get_model(model_cfg, mu.make_dummy_scaler_params(model_cfg),
-                             nnx.Rngs(0))
+    if restore:
+        # tolerant restore (handles old-flax rng-state nesting); loads the
+        # trained weights + scaler params so the policy actually controls.
+        model, model_cfg, step = mu.load_model_from_ckpt(ckpt_dir)
+        print(f"[mppi_server] restored trained weights (step {step})", flush=True)
+    else:
+        model_cfg = OmegaConf.to_container(
+            OmegaConf.load(os.path.join(ckpt_dir,
+                                        paths.get_model_config_filename())),
+            resolve=True,
+        )
+        model = models.get_model(model_cfg, mu.make_dummy_scaler_params(model_cfg),
+                                 nnx.Rngs(0))
+        print("[mppi_server] fresh-init weights (no restore)", flush=True)
     controller = MppiController(model, model_cfg, ctrl_cfg)
     return controller
 
@@ -69,6 +78,8 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5599)
     ap.add_argument("--simdist-dir", default="/shared/giacomo/simdist")
+    ap.add_argument("--fresh", action="store_true",
+                    help="Skip checkpoint restore (random-init weights).")
     args = ap.parse_args()
 
     # Bind the port BEFORE the slow jax import so readiness probes / the client
@@ -89,7 +100,8 @@ def main() -> None:
         op = msg["op"]
         if op == "build":
             state["controller"] = build_controller(
-                args.simdist_dir, msg["ckpt_dir"], msg["ctrl_cfg"])
+                args.simdist_dir, msg["ckpt_dir"], msg["ctrl_cfg"],
+                restore=not args.fresh)
             print("[mppi_server] controller built", flush=True)
             return {"ok": True}
         c = state["controller"]

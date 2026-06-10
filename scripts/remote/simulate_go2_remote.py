@@ -129,6 +129,14 @@ class Go2Sim:
         # create env cfg
         env_cfg = Go2SimEnvCfg()
 
+        # Disable domain-randomization events that wrap now-class-based IsaacLab
+        # mdp terms (randomize_actuator_gains / randomize_joint_parameters) as if
+        # they were plain functions — incompatible with our IsaacLab 2.3.2 and
+        # irrelevant to this visualisation.
+        for _ev in ("joint_stiffness_and_damping", "joint_friction"):
+            if getattr(env_cfg.events, _ev, None) is not None:
+                setattr(env_cfg.events, _ev, None)
+
         # set command in env
         env_cfg.commands.base_velocity.forward_vel = cfg["task"]["forward_vel"]
         env_cfg.commands.base_velocity.kx = cfg["task"]["kx"]
