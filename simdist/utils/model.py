@@ -31,20 +31,48 @@ def load_model_from_ckpt(
     model = models.get_model(model_cfg, dummy_scaler_params, nnx.Rngs(0))
     graphdef, model_state = nnx.split(model)
 
+    model_pure_dict = model_state.to_pure_dict()
     with ocp.CheckpointManager(
         ckpt_dir, options=ocp.CheckpointManagerOptions(read_only=True)
     ) as mngr:
         if step is None:
             step = mngr.latest_step()
-        restored_pure_dict = mngr.restore(
-            step,
-            args=ocp.args.StandardRestore(item=model_state.to_pure_dict()),
-        )
+        try:
+            restored_pure_dict = mngr.restore(
+                step,
+                args=ocp.args.StandardRestore(item=model_pure_dict),
+            )
+        except ValueError:
+            # The checkpoint was saved under a flax version whose nnx state tree
+            # differs from the current one (e.g. attention rng streams nested as
+            # `rngs.default.{count,key}` in flax 0.10.x vs `rngs.{count,key}` in
+            # 0.12.x), which makes the strict StandardRestore structure check
+            # fail. Restore the raw on-disk tree and copy only the leaves whose
+            # path exists in the current model graph (all learned parameters and
+            # the scaler params); leave freshly-initialised rng streams untouched
+            # — they are re-seeded per run and do not affect deterministic
+            # inference.
+            raw = mngr.restore(step, args=ocp.args.StandardRestore())
+            _copy_matching_leaves(model_pure_dict, raw)
+            restored_pure_dict = model_pure_dict
 
     model_state.replace_by_pure_dict(restored_pure_dict)
     model = nnx.merge(graphdef, model_state)
 
     return model, model_cfg, step
+
+
+def _copy_matching_leaves(dst: dict, src: dict) -> None:
+    """Recursively copy leaves from ``src`` into ``dst`` where the same nested
+    path exists in both. Leaves present only in ``dst`` keep their value; leaves
+    present only in ``src`` are ignored."""
+    for k, v in src.items():
+        if k not in dst:
+            continue
+        if isinstance(v, dict) and isinstance(dst[k], dict):
+            _copy_matching_leaves(dst[k], v)
+        elif not isinstance(v, dict) and not isinstance(dst[k], dict):
+            dst[k] = jnp.asarray(v)
 
 
 def make_dummy_scaler_params(cfg: dict):

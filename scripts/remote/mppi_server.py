@@ -1,0 +1,142 @@
+"""MPPI / world-model inference server — Process B of the 2-process Spark loop.
+
+Runs in the JAX venv (jax 0.10.1 / flax 0.12.7 / numpy 2.x, GPU). Holds the real
+`MppiController`; receives ControllerInput + command dicts from the Isaac process
+over a localhost socket and returns action sequences. See `simulate_go2_remote.py`
+for Process A and `ipc.py` for the wire protocol.
+
+Weights are NOT restored from the checkpoint (fresh init): this is a
+plumbing / visualisation harness, so only the architecture and observation/action
+dims (read from `model_config.yaml`) matter. Swap in a real load for evaluation.
+
+Run:
+    /shared/giacomo/jax_spark_test/bin/python mppi_server.py --port 5599 \
+        --simdist-dir /shared/giacomo/simdist
+"""
+import argparse
+import os
+import socket
+import sys
+import traceback
+import types as _t
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+import ipc  # noqa: E402
+
+
+def _install_stubs() -> None:
+    """`simdist.data.dataset` pulls torch + h5py for a type only (DatasetBatch),
+    never used on the inference path. Stub them so the JAX side stays lean."""
+    for n in ("torch", "torch.utils", "torch.utils.data"):
+        sys.modules.setdefault(n, _t.ModuleType(n))
+    d = sys.modules["torch.utils.data"]
+    d.Dataset = type("Dataset", (), {})
+    d.DataLoader = object
+    d.random_split = None
+    d.get_worker_info = None
+    sys.modules["torch"].utils = sys.modules["torch.utils"]
+    sys.modules["torch.utils"].data = d
+    ds = _t.ModuleType("simdist.data.dataset")
+    ds.DatasetBatch = type("DatasetBatch", (dict,), {})
+    sys.modules["simdist.data.dataset"] = ds
+
+
+def build_controller(simdist_dir: str, ckpt_dir: str, ctrl_cfg: dict):
+    sys.path.insert(0, simdist_dir)
+    import flax.nnx as nnx
+    from omegaconf import OmegaConf
+
+    from simdist.modeling import models
+    from simdist.utils import model as mu, paths
+    from simdist.control.mppi import MppiController
+
+    model_cfg = OmegaConf.to_container(
+        OmegaConf.load(os.path.join(ckpt_dir, paths.get_model_config_filename())),
+        resolve=True,
+    )
+    model = models.get_model(model_cfg, mu.make_dummy_scaler_params(model_cfg),
+                             nnx.Rngs(0))
+    controller = MppiController(model, model_cfg, ctrl_cfg)
+    return controller
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=5599)
+    ap.add_argument("--simdist-dir", default="/shared/giacomo/simdist")
+    args = ap.parse_args()
+
+    # Bind the port BEFORE the slow jax import so readiness probes / the client
+    # can connect immediately (the connection just queues until we accept).
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((args.host, args.port))
+    srv.listen(1)
+    print(f"[mppi_server] listening on {args.host}:{args.port}", flush=True)
+
+    _install_stubs()
+    import jax
+    print(f"[mppi_server] jax {jax.__version__} devices={jax.devices()}", flush=True)
+
+    state = {"controller": None}
+
+    def handle(msg: dict) -> dict:
+        op = msg["op"]
+        if op == "build":
+            state["controller"] = build_controller(
+                args.simdist_dir, msg["ckpt_dir"], msg["ctrl_cfg"])
+            print("[mppi_server] controller built", flush=True)
+            return {"ok": True}
+        c = state["controller"]
+        if c is None:
+            return {"ok": False, "err": "controller not built"}
+        if op == "initialize":
+            c.initialize(msg["x"], msg["cmd"])
+            return {"ok": True}
+        if op == "reset":
+            c.reset(msg["x"], msg["cmd"])
+            return {"ok": True}
+        if op == "set_fut_cmd":
+            c.set_fut_cmd(msg["fut_cmd"])
+            return {"ok": True}
+        if op == "update":
+            c.update(msg["x"])
+            return {"ok": True}
+        if op == "run_control":
+            return {"ok": True, "out": c.run_control()}
+        return {"ok": False, "err": f"unknown op {op}"}
+
+    # Serve sequential clients (the controller state persists across
+    # connections), so a readiness probe that connects and immediately
+    # disconnects does not kill the server.
+    try:
+        while True:
+            conn, addr = srv.accept()
+            print(f"[mppi_server] client connected: {addr}", flush=True)
+            try:
+                while True:
+                    msg = ipc.recv_msg(conn)
+                    if msg is None:
+                        break
+                    try:
+                        rep = handle(msg)
+                    except Exception as e:  # noqa: BLE001
+                        traceback.print_exc()
+                        rep = {"ok": False, "err": repr(e)}
+                    ipc.send_msg(conn, rep)
+            finally:
+                conn.close()
+            print("[mppi_server] client disconnected; awaiting next", flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.close()
+
+
+if __name__ == "__main__":
+    main()
