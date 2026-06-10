@@ -85,19 +85,21 @@ class TransformerEncoder(nnx.Module):
         mask: str | None = None,
         **kwargs,
     ):
-        self.layers = [
-            TransformerEncoderLayer(
-                embed_dim=embed_dim,
-                mlp_hidden_dim=mlp_hidden_dim,
-                num_heads=num_heads,
-                attention_dropout_rate=attention_dropout_rate,
-                mlp_dropout_rate=mlp_dropout_rate,
-                deterministic=deterministic,
-                mask=mask,
-                rngs=rngs,
-            )
-            for _ in range(num_layers)
-        ]
+        self.layers = nnx.List(
+            [
+                TransformerEncoderLayer(
+                    embed_dim=embed_dim,
+                    mlp_hidden_dim=mlp_hidden_dim,
+                    num_heads=num_heads,
+                    attention_dropout_rate=attention_dropout_rate,
+                    mlp_dropout_rate=mlp_dropout_rate,
+                    deterministic=deterministic,
+                    mask=mask,
+                    rngs=rngs,
+                )
+                for _ in range(num_layers)
+            ]
+        )
 
     def __call__(self, x, mask=None, deterministic: bool | None = None):
         for layer in self.layers:
@@ -202,19 +204,21 @@ class TransformerDecoder(nnx.Module):
         mask: str | None = "causal",
         **kwargs,
     ):
-        self.layers = [
-            TransformerDecoderLayer(
-                embed_dim=embed_dim,
-                mlp_hidden_dim=mlp_hidden_dim,
-                num_heads=num_heads,
-                attention_dropout_rate=attention_dropout_rate,
-                mlp_dropout_rate=mlp_dropout_rate,
-                deterministic=deterministic,
-                mask=mask,
-                rngs=rngs,
-            )
-            for _ in range(num_layers)
-        ]
+        self.layers = nnx.List(
+            [
+                TransformerDecoderLayer(
+                    embed_dim=embed_dim,
+                    mlp_hidden_dim=mlp_hidden_dim,
+                    num_heads=num_heads,
+                    attention_dropout_rate=attention_dropout_rate,
+                    mlp_dropout_rate=mlp_dropout_rate,
+                    deterministic=deterministic,
+                    mask=mask,
+                    rngs=rngs,
+                )
+                for _ in range(num_layers)
+            ]
+        )
 
     def __call__(
         self, x, encoder_outputs, mask=None, deterministic: bool | None = None
@@ -267,8 +271,8 @@ class MLP(nnx.Module):
         dropout_rate: float = 0.0,
         deterministic: bool | None = None,
     ):
-        self.layers: List[nnx.Linear] = []
-        self.dropout_layers: List[nnx.Dropout] = []
+        self.layers: nnx.List = nnx.List([])
+        self.dropout_layers: nnx.List = nnx.List([])
         prev_dim = input_dim  # Track input size for each layer
         self.output_dim = output_dim
 
@@ -316,7 +320,7 @@ class CNN(nnx.Module):
         self.wd_in = wd_in
 
         # Define convolutional layers
-        self.layers = []
+        self.layers = nnx.List([])
         prev_channels = in_channels  # Track the number of input channels
 
         for out_channels, stride in zip(features, strides):
@@ -376,7 +380,7 @@ class TransposeCNN(nnx.Module):
     ):
         self.strides = strides
 
-        self.layers = []
+        self.layers = nnx.List([])
         prev_channels = in_channels  # Track the number of input channels
 
         for out_channels, stride in zip(features, strides):

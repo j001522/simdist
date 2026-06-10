@@ -14,8 +14,8 @@ class Scaler(nnx.Module):
         scaler_params_mapping: types.ScalerParamsMapping,
         subset_mapping: dict[str, jnp.ndarray] | None = None,
     ):
-        self.scaler_params: dict[str, nnx.Variable] = jax.tree.map(
-            nnx.Variable, scaler_params
+        self.scaler_params: dict[str, nnx.Variable] = nnx.data(
+            jax.tree.map(nnx.Variable, scaler_params)
         )
         self.scaler_params_mapping = scaler_params_mapping
         self.subset_mapping = subset_mapping
