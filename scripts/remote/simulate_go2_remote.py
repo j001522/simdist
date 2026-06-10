@@ -20,7 +20,11 @@ import socket
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+# repo root (contains the `simdist` package); simdist is not pip-installed in the
+# Isaac python on purpose (its deps pull jax/numpy>=2), so add it to the path.
+_SIMDIST_ROOT = os.path.dirname(os.path.dirname(_HERE))
 sys.path.insert(0, _HERE)
+sys.path.insert(0, _SIMDIST_ROOT)
 import ipc  # noqa: E402
 
 
