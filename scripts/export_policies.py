@@ -37,6 +37,13 @@ from rsl_rl.runners import OnPolicyRunner
 from isaaclab_tasks.utils import parse_env_cfg
 
 from simdist import rl  # noqa: F401
+
+# Register OmniReset (UR5e peg insertion) gym tasks so --task OmniReset-... resolves.
+try:
+    import uwlab_tasks  # noqa: F401
+except ImportError:
+    pass
+
 from simdist.utils.torch import export_torch_as_jit
 from simdist.utils import paths
 

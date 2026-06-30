@@ -3,7 +3,7 @@
 print("Starting Isaac Sim")
 from isaaclab.app import AppLauncher
 
-app_launcher = AppLauncher(headless=True)
+app_launcher = AppLauncher(headless=True, enable_cameras=True)
 simulation_app = app_launcher.app
 
 

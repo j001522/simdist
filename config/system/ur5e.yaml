@@ -1,0 +1,59 @@
+name: ur5e
+
+# Proprioceptive observations recorded as o_t and fed to the world-model encoder.
+# Paper: the encoder concatenates the ResNet image embeddings with the robot's
+# 6 joint observations. Noise here is added as data augmentation during
+# world-model pretraining (not during data generation).
+proprio_obs:
+  types:
+    - name: arm_joint_pos
+      dim: 6
+      noise: 0.01
+
+# Exteroceptive observations: three 224x224 RGB images (front/overhead, side,
+# wrist), saved unprocessed as int8. Encoded with a pretrained ResNet-18.
+extero_obs:
+  types:
+    - name: front_rgb
+      dim: [224, 224, 3]
+      noise: 0.0
+    - name: side_rgb
+      dim: [224, 224, 3]
+      noise: 0.0
+    - name: wrist_rgb
+      dim: [224, 224, 3]
+      noise: 0.0
+
+# Peg insertion has no command conditioning (unlike Go2 velocity commands).
+cmd:
+  dim: 0
+
+# Action space: 6-d relative end-effector pose (RelCartesianOSC) + 1 binary
+# gripper = 7 dims. Gaussian action noise std is sampled per-env in
+# [min_noise, max_noise] during data generation (Algorithm 2, Sigma_j).
+# The binary gripper dim is left uncorrupted (min=max=0).
+# Calibrated to the measured per-dim raw-action std (2-5) from a generated
+# dataset: min ~= 0.05*std, max ~= 1*std (Go2 used ~[0.05x, 2.5x]; we keep the
+# max conservative for contact-rich insertion). Tune as needed.
+actions:
+  - name: ee_dx
+    min_noise: 0.10
+    max_noise: 2.5
+  - name: ee_dy
+    min_noise: 0.10
+    max_noise: 2.5
+  - name: ee_dz
+    min_noise: 0.25
+    max_noise: 5.0
+  - name: ee_drx
+    min_noise: 0.20
+    max_noise: 3.5
+  - name: ee_dry
+    min_noise: 0.20
+    max_noise: 3.5
+  - name: ee_drz
+    min_noise: 0.05
+    max_noise: 1.2
+  - name: gripper
+    min_noise: 0.0
+    max_noise: 0.0

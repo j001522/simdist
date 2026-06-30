@@ -5,9 +5,28 @@ import yaml
 import torch
 from tqdm import trange
 
-from simdist.rl.go2 import Go2RecordEnvCfg, ManagerBasedRLEnvRecord
 from simdist.utils.torch import get_actor_critic_from_iteration
 from simdist.utils import paths
+
+
+def _get_record_env(system_name: str):
+    """Return (RecordEnvCfg, ManagerBasedRLEnvRecord) for the given system.
+
+    Lazily imported so we only pull in the env (and its IsaacLab task) actually
+    being recorded.
+    """
+    if system_name == "go2":
+        from simdist.rl.go2 import Go2RecordEnvCfg, ManagerBasedRLEnvRecord
+
+        return Go2RecordEnvCfg, ManagerBasedRLEnvRecord
+    if system_name in ("ur5e", "ur5e_omnireset"):
+        from simdist.rl.ur5e_omnireset import (
+            Ur5eRecordEnvCfg,
+            ManagerBasedRLEnvRecord,
+        )
+
+        return Ur5eRecordEnvCfg, ManagerBasedRLEnvRecord
+    raise ValueError(f"Unknown system for data recording: {system_name!r}")
 
 
 class DataRecorder:
@@ -46,12 +65,29 @@ class DataRecorder:
         self.num_non_experts = len(self.non_expert_policies)
         self.expert_prob = cfg["expert_prob"]
 
-        # create environment
-        env_cfg = Go2RecordEnvCfg()
+        # create environment (selected by the system config)
+        RecordEnvCfg, ManagerBasedRLEnvRecord = _get_record_env(cfg["system"]["name"])
+        env_cfg = RecordEnvCfg()
         env_cfg.seed = seed
         env_cfg.recorders.dataset_export_dir_path = dataset_path
         env_cfg.recorders.dataset_filename = paths.get_raw_data_filename()
         env_cfg.scene.num_envs = self.N
+
+        # Optional: collapse the manipulation env to the simplified single-nominal
+        # task (all DR off, one grasped reset bank). Single source of truth shared
+        # with the eval/MPPI side -> data is recorded and tested in the same
+        # conditions. See simdist/rl/manip_simplify.py.
+        simp = cfg.get("simplify") or {}
+        if cfg["system"]["name"] in ("ur5e", "ur5e_omnireset") and simp.get("enabled"):
+            from simdist.rl.manip_simplify import simplify_events
+
+            simplify_events(
+                env_cfg.events,
+                dataset_dir=simp["reset_dir"],
+                reset_types=simp["reset_types"],
+                probs=simp["probs"],
+            )
+            print(f"[simplify] DR off; reset bank {simp['reset_types']} (probs {simp['probs']})")
 
         self.env = ManagerBasedRLEnvRecord(env_cfg, self.critic)
 
@@ -172,6 +208,16 @@ class DataRecorder:
     def run(self):
         # reset environment
         obs, _ = self.env.reset()
+
+        # Desynchronize episode terminations across envs. With a fixed-horizon
+        # env all envs would otherwise time_out on the same step, triggering a
+        # single synchronized HDF5 export of every env's (image-heavy) episode
+        # plus a full all-env reset -> multi-GB write + reset storm that stalls
+        # the run. Seeding episode_length_buf with random offsets staggers the
+        # resets so ~num_envs/horizon episodes are written per step instead.
+        self.env.episode_length_buf = torch.randint_like(
+            self.env.episode_length_buf, high=int(self.env.max_episode_length)
+        )
 
         # initialize policies
         self.init_policies(obs)

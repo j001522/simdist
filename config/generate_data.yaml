@@ -1,38 +1,52 @@
 defaults:
-  - system: go2
+  - system: ur5e
 
+# Name of the RL run under checkpoints/rl/<rl_run> (symlink the Snellius run dir
+# here; export_policies writes policies/ and critics/ inside it).
 rl_run:
-envs: 4096
-steps: 25000
+envs: 256       # parallel envs; rendering 3 cameras is heavy, keep modest
+steps: 5000    # total env steps; trajectories accumulate as episodes reset (default 25000)
 seed: 42
 
-expert: 4999  # The iteration number of the expert policy
-expert_prob: 0.5  # Probability of using the expert policy
+# Simplified single-nominal task (ur5e only): all domain randomization off,
+# dynamics pinned to the sysid nominal, one grasped reset bank. Shrinks the
+# data-hungry world model's manifold for cheap pipeline validation. Set
+# enabled: false to record under the full DR distribution again. Widen
+# reset_types (e.g. add GraspedVertLow, probs [0.5, 0.5]) if the WM underfits.
+# Banks come from experiments/ood_insertion/build_reset_banks.py.
+simplify:
+  enabled: true
+  reset_dir: /shared/giacomo/experiments/ood_insertion/resets
+  reset_types: [GraspedVertHigh]
+  probs: [1.0]
 
-# The iteration numbers of the non-expert policies
+expert: 1700  # iteration number of the expert policy (best t0+t2, tied-best overall ~0.90)
+expert_prob: 0.5  # reset with a sub-optimal checkpoint with prob 0.5 (paper)
+
+# Sub-optimal policy checkpoints (paper: saved every 100 up to checkpoint 1000).
 non_experts:
   - 0
-  - 50
   - 100
-  - 150
   - 200
-  - 250
   - 300
   - 400
   - 500
+  - 600
+  - 700
+  - 800
+  - 900
   - 1000
-  - 2000
 
 action_corruption:
   never_noise_prob: 0.025  # Probability of envs never having noise
   intervals:
-    # noise is added for a random number of consecutive steps this interval
+    # Paper: Gaussian noise injected for contiguous intervals U[1, 5] steps,
+    # interleaved with noise-free intervals U[5, 10] steps.
     noise_min: 1
-    noise_max: 50
+    noise_max: 5
 
-    # then, no noise is added for a random number of consecutive steps this interval
-    no_noise_min: 25
-    no_noise_max: 500
-  
+    no_noise_min: 5
+    no_noise_max: 10
+
     # repeat the above two steps until data collection is done. The sampled
     # intervals are different for each env.
