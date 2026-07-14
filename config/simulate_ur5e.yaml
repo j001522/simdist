@@ -1,0 +1,24 @@
+defaults:
+  - control: mppi_manip
+  - _self_
+
+model:
+  checkpoint:   # world-model checkpoint dir under model_checkpoints/
+  step:         # leave blank for latest
+
+sim:
+  num_episodes: 5      # planner episodes to run
+  max_steps: 200       # per-episode step cap (env time_out is 16 s @ 5 Hz = 80 steps)
+  seed: 42
+  # Ur5eRecordEnvCfg's simplified variant: DR off, single grasped reset bank. Must
+  # match how the dataset the world model was trained on was collected -- planning
+  # against a model trained on the simplified task in the full-DR env is off-
+  # distribution for the encoder, not just the dynamics.
+  simplified: true
+  reset_dir: /shared/giacomo/experiments/ood_insertion/resets
+  reset_types: [GraspedVertHigh]
+
+wandb:
+  log: false
+  run_name:
+  entity:
