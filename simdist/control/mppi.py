@@ -56,6 +56,16 @@ class MppiController(ControllerBase):
         # gripper at corr 0.94), so pinning the dim to it restores correct behaviour
         # without retraining. Remove once the value model is trained on gripper
         # counterfactuals (i.e. with non-zero gripper noise in data generation).
+        # Weight on the terminal value in the planning return. 1.0 = paper behaviour.
+        # Set to 0.0 to plan on the reward horizon alone -- useful when the transferred
+        # value model is untrustworthy. For UR5e the recorded V^e targets are
+        # uncorrelated with the true discounted return-to-go (corr -0.01), so the value
+        # head, which reproduces them faithfully, feeds MPPI noise that anti-correlates
+        # with insertion. The reward head is sound (corr 0.86 with recorded reward) and
+        # the reward is dense, so reward-only planning is a usable fallback until the
+        # critic is fixed.
+        self.value_weight = float(self.ctrl_cfg.get("value_weight", 1.0))
+
         frozen = self.ctrl_cfg.get("frozen_action_dims") or []
         self.frozen_dims = list(frozen)
         # multiplicative noise mask: 0 on frozen dims, 1 elsewhere
@@ -232,6 +242,6 @@ class MppiController(ControllerBase):
 
     def _calc_returns(self, y: types.WorldModelSchema.Outputs) -> jnp.ndarray:
         rewards = jnp.sum(y["rewards"] * self.discounts, axis=-1)
-        value = y["values"][:, -1] * self.final_discount
+        value = self.value_weight * y["values"][:, -1] * self.final_discount
         returns = rewards + value
         return returns

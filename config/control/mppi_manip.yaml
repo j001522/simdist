@@ -33,6 +33,18 @@ seed: 42
 # The real fix is non-zero gripper noise in config/system/ur5e.yaml + regenerate + retrain.
 frozen_action_dims: []
 
+# Weight on the terminal value term in the planning return. 1.0 = paper behaviour.
+#
+# Set to 0.0 to plan on the 5-step reward horizon alone. DIAGNOSTIC: the expert critic
+# used for data generation emits value targets that are UNCORRELATED with the true
+# discounted return-to-go computed from the recorded rewards (corr -0.01), and rank a
+# seated peg BELOW an unseated one at every episode phase. The world model's value head
+# reproduces those targets faithfully (corr 0.92), so the terminal value actively pushes
+# the planner away from insertion. The reward head is sound (corr 0.86) and the reward is
+# dense (progress_context + ee_asset_distance + dense_success), so reward-only planning
+# still has a gradient to follow. Restore to 1.0 once the critic is fixed.
+value_weight: 1.0
+
 # NOTE: these three stds are scalars applied to all 7 action dims, and MPPI plans
 # in RAW action units (the model scales fut_acts internally and unscales the policy
 # head output). Two known problems, deliberately left alone for now so the effect of
