@@ -46,6 +46,29 @@ class MppiController(ControllerBase):
         self.rngs = nnx.Rngs(self.ctrl_cfg["seed"])
         self.dummy_actions = jnp.zeros((self.T, self.act_dim))
 
+        # Action dims excluded from planning: they are not perturbed and are pinned to
+        # the base policy's prediction, so the planner cannot move them. Needed when the
+        # reward/value model mis-ranks a dim the base policy nonetheless gets right --
+        # for UR5e that is the gripper (dim 6): the world model was trained with zero
+        # injected gripper noise, so it only ever saw the gripper open in states that
+        # were already successful, and learned open => high value. MPPI exploits that and
+        # drops the peg. The base-policy head is unaffected (it reproduces the expert
+        # gripper at corr 0.94), so pinning the dim to it restores correct behaviour
+        # without retraining. Remove once the value model is trained on gripper
+        # counterfactuals (i.e. with non-zero gripper noise in data generation).
+        frozen = self.ctrl_cfg.get("frozen_action_dims") or []
+        self.frozen_dims = list(frozen)
+        # multiplicative noise mask: 0 on frozen dims, 1 elsewhere
+        mask = np.ones((self.act_dim,), dtype=np.float32)
+        mask[self.frozen_dims] = 0.0
+        self.noise_mask = jnp.asarray(mask)
+        if self.frozen_dims:
+            print(
+                f"[mppi] action dims {self.frozen_dims} frozen to the base policy "
+                "(not planned over)",
+                flush=True,
+            )
+
     def reset(self, x: ControllerInput, cmd: np.ndarray):
         super().reset(x, cmd)
         self.mppi_state = MppiState(
@@ -132,11 +155,12 @@ class MppiController(ControllerBase):
             fut_cmds[None], (batch_size,) + fut_cmds.shape
         )
 
-        # add noise to base actions
+        # add noise to base actions (frozen dims get none: noise_mask is 0 there)
         key, key_base_act = jax.random.split(key)
         base_act_noise = (
             jax.random.normal(key_base_act, (self.num_base_trajs, self.T, self.act_dim))
             * self.ctrl_cfg["base_act_std"]
+            * self.noise_mask
         )
         noised_base_policy_actions = base_policy_actions + base_act_noise
 
@@ -144,6 +168,13 @@ class MppiController(ControllerBase):
         prev_mean = mppi_state.mean
         mean = jnp.roll(prev_mean, shift=self.shift, axis=0)
         mean = mean.at[self.shift :].set(0.0)
+        # Frozen dims: seed the mean with the base policy instead of the zero fill above.
+        # With zero noise on those dims (noise_mask), every sampled trajectory -- both
+        # the candidates and the base-policy block -- then carries this exact value, so
+        # the elite-weighted update cannot move it and the planner leaves it alone.
+        mean = mean.at[:, self.frozen_dims].set(
+            base_policy_actions[:, self.frozen_dims]
+        )
         std = jnp.ones((self.T, self.act_dim)) * self.ctrl_cfg["init_std"]
 
         # each iterations do the following
@@ -157,6 +188,7 @@ class MppiController(ControllerBase):
                     key_act, (self.ctrl_cfg["num_samples"], self.T, self.act_dim)
                 )
                 * std
+                * self.noise_mask
             )
             noised_acts = mean + act_noise
             # run model with both base policy and noised actions
