@@ -6,7 +6,6 @@ import json
 
 import torch
 from tqdm import trange
-from isaaclab.utils.datasets import HDF5DatasetFileHandler
 
 from simdist.utils import config as config_utils
 from simdist.utils import paths
@@ -45,6 +44,11 @@ class DataProcessor:
         self.exp_pol_flags_tracker = _RunningStats(0)
 
     def run(self):
+        # Lazy: only the Go2 flat-vector path needs Isaac's episode loader. Keeping this
+        # out of module scope lets manip_data_processor reuse _H5Appender/_RunningStats
+        # in the Isaac-free simdist-jax env (see manipulation_port.md 3.0).
+        from isaaclab.utils.datasets import HDF5DatasetFileHandler
+
         raw_data_path = paths.get_raw_data_path(self.dataset_name)
         raw_data_handler = HDF5DatasetFileHandler()
         raw_data_handler.open(raw_data_path)
