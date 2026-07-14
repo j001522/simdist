@@ -2,7 +2,7 @@ import flax.nnx as nnx
 import jax.numpy as jnp
 import jax
 
-from simdist.modeling import types, modules
+from simdist.modeling import types, modules, resnet
 from simdist.utils import config, extero
 
 
@@ -118,6 +118,129 @@ class QuadrupedEncoder(WorldModelEncoderBase):
         concatenated = jnp.concatenate([proprio_obs, hm_enc], axis=-1)
         latent = self.latent_mlp(concatenated, deterministic=deterministic)
         return latent
+
+
+class ManipulationEncoder(WorldModelEncoderBase):
+    """Vision encoder (paper app:manip): each of the 3 cameras -> a SHARED ResNet-18
+    -> 3x512, concat the raw 6 joint obs -> MLP -> z(latent_dim).
+
+    History path mirrors QuadrupedEncoder (proprio + action tokens with temporal/type
+    encodings). Per "minimal history", only the LATEST image enters encode_latent; the
+    history carries no images. extero_obs in the Inputs schema holds the camera images
+    (..., n_cam, H, W, 3), replacing Go2's flat height-scan vector.
+
+    The ResNet is random-initialized here; ImageNet weights are loaded as an explicit
+    pipeline step (trainer calls resnet.load_torchvision_resnet18(encoder.resnet) when
+    encoder.extero_obs.resnet.pretrained == "imagenet"). Keeps __init__ torch-free.
+    """
+
+    def __init__(self, cfg: dict, rngs: nnx.Rngs):
+        super().__init__(cfg, rngs)
+
+        h_size = self.latent_dim * self.enc_cfg["mlp_hidden_size_factor"]
+        H = self.model_cfg["dataset"]["history_length"]
+        self.hist_enc_len = 2 * H
+
+        resnet_cfg = self.enc_cfg["extero_obs"]["resnet"]
+        self.n_cam = len(config.extero_obs_names_from_sys_config(self.sys_cfg))
+        self.per_image_embed_dim = resnet_cfg["per_image_embed_dim"]
+        self.freeze_resnet = resnet_cfg.get("freeze", False)
+        self.resnet = resnet.ResNet18Backbone(rngs=rngs)
+        assert self.resnet.out_features == self.per_image_embed_dim
+
+        self.proprio_obs_proj = modules.MLP(
+            input_dim=self.proprio_obs_dim,
+            hidden_dims=[h_size] * self.enc_cfg["proprio_obs_layers"],
+            output_dim=self.latent_dim,
+            rngs=rngs,
+        )
+        self.act_proj = modules.MLP(
+            input_dim=self.act_dim,
+            hidden_dims=[h_size] * self.enc_cfg["action_layers"],
+            output_dim=self.latent_dim,
+            rngs=rngs,
+        )
+        # concat = [3x512 image feats, raw 6 joint obs] -> z(latent_dim)
+        self.latent_mlp = modules.MLP(
+            input_dim=self.n_cam * self.per_image_embed_dim + self.proprio_obs_dim,
+            hidden_dims=[h_size] * self.enc_cfg["latent_layers"],
+            output_dim=self.latent_dim,
+            rngs=rngs,
+        )
+
+        self.temporal_enc = nnx.Param(
+            jax.random.normal(rngs["params"](), (H + 1, self.latent_dim)) * 0.02
+        )
+        num_types = 3  # proprio_obs, act, latent
+        self.type_enc = nnx.Param(
+            jax.random.normal(rngs["params"](), (num_types, self.latent_dim)) * 0.02
+        )
+
+        # Bounds ||z||: the latent-dynamics target is the encoder's own output under
+        # stop_grad, so nothing else anchors its scale (it inflated 4 -> 46 in 600 steps
+        # and the dynamics MSE followed). Applied inside encode_latent so the target and
+        # encoding["latent"] are normalized identically.
+        # use_scale/use_bias off: a learnable gamma would let the encoder re-inflate the
+        # latent, which is the pressure we are removing. ||z|| is then pinned at
+        # sqrt(latent_dim), same property SimNorm gives TD-MPC2.
+        self.layer_norm_1 = nnx.LayerNorm(
+            self.latent_dim, use_scale=False, use_bias=False, rngs=rngs
+        )
+
+    def __call__(
+        self,
+        x: types.WorldModelSchema.Inputs,
+        deterministic: bool | None = None,
+    ) -> types.WorldModelSchema.Encoding:
+        B = x["proprio_obs_hist"].shape[0]
+
+        # encode history (proprio + action tokens); no images in history
+        proprio_obs_hist = x["proprio_obs_hist"][:, :-1]
+        proprio_obs_hist = self.proprio_obs_proj(
+            proprio_obs_hist, deterministic=deterministic
+        )
+        act_hist = self.act_proj(x["acts_hist"], deterministic=deterministic)
+
+        # encode latent from the most recent proprio + the latest camera images
+        last_proprio_obs = x["proprio_obs_hist"][:, -1]
+        latent = self.encode_latent(
+            last_proprio_obs, x["extero_obs"], deterministic=deterministic
+        )
+
+        proprio_obs_hist += self.temporal_enc[:-1]
+        act_hist += self.temporal_enc[:-1]
+        latent += self.temporal_enc[-1]
+
+        proprio_obs_hist += self.type_enc[0]
+        act_hist += self.type_enc[1]
+        latent += self.type_enc[2]
+
+        hist_enc = jnp.zeros((B, self.hist_enc_len, self.latent_dim))
+        hist_enc = hist_enc.at[:, 0::2].set(proprio_obs_hist)
+        hist_enc = hist_enc.at[:, 1::2].set(act_hist)
+
+        return {"history": hist_enc, "latent": latent}
+
+    def encode_latent(
+        self,
+        proprio_obs: jnp.ndarray,
+        extero_obs: jnp.ndarray,
+        deterministic: bool | None = None,
+    ) -> jnp.ndarray:
+        # extero_obs: (..., n_cam, H, W, 3) camera images. ResNet flattens leading dims;
+        # shape-agnostic so this also serves target encoding E(o_{t+1:t+T}) in the loss.
+        feats = self.resnet(
+            extero_obs, train=not bool(deterministic), normalize=True
+        )  # (..., n_cam, 512)
+        if self.freeze_resnet:
+            feats = jax.lax.stop_gradient(feats)
+        feats = feats.reshape(
+            feats.shape[:-2] + (self.n_cam * self.per_image_embed_dim,)
+        )
+        concatenated = jnp.concatenate([feats, proprio_obs], axis=-1)
+        enc_latent = self.latent_mlp(concatenated, deterministic=deterministic)
+        enc_latent = self.layer_norm_1(enc_latent)
+        return enc_latent
 
 
 class HeightMapEncoder(nnx.Module):

@@ -1,0 +1,85 @@
+# Manipulation (UR5e peg insertion) world model.
+# Values tagged [Table II] come from simdist_paper.tex tab:model_man (app:manip).
+# Values tagged [TBD] are placeholders pending encoder/dataset impl + data inspection.
+# Mirrors config/model/quadruped_world_model.yaml; differences from it are noted.
+type: manipulation_world_model
+
+dataset:
+  type: manipulation_world_model
+  history_length: 10      # [TBD] world-model history H (paper "minimal history"); tune
+  prediction_length: 10   # [TBD] planning/prediction horizon T; tune to control rate
+  augmentations:
+    add_noise: true       # proprio gaussian noise [app:manip]
+    image:                # visual augs [app:manip] -- consumed by ManipulationWorldModelDataset (3.3)
+      color_jitter: true
+      gaussian_blur: true
+      random_crop: true
+
+dropout:
+  mlp: 0.2                 # [TBD] not specified for manip; kept from quadruped
+  attention: 0.05         # [TBD] idem
+
+latent_dim: 64            # [Table II] embedding dimension
+
+# Vision encoder: ResNet-18 (ImageNet) per camera -> 3x512 -> stack, concat 6 joint
+# obs -> MLP -> z(64) [app:manip]. Schema below is the contract for ManipulationEncoder
+# (3.1, not yet implemented); fields marked [TBD-schema] may change when it lands.
+encoder:
+  type: manipulation
+  mlp_hidden_size_factor: 2   # [TBD-schema] projection MLP width factor
+  proprio_obs_layers: 2       # [TBD-schema] joint-obs MLP depth
+  extero_obs:
+    resnet:
+      variant: resnet18       # [Table II / app:manip]
+      pretrained: imagenet    # [app:manip] ImageNet weights
+      freeze: false           # [app:manip] paper does not freeze the ResNet
+      per_image_embed_dim: 512  # [app:manip] 3x512 before stacking
+  action_layers: 0            # schema parity with quadruped encoder; encoder is action-free
+  latent_layers: 2            # [TBD-schema] post-concat MLP -> z depth
+
+embedding:
+  mlp_hidden_size_factor: 2
+  future_acts_layers: 0
+  future_cmds_layers: 0       # cmd_dim=0 for manip (no goal command); see 3.2
+  reward_layers: 0
+  value_layers: 0
+
+# All transformer MLP hidden size = 256 [Table II] = latent_dim(64) * factor(4).
+dynamics:
+  attention:
+    layers: 3                 # [Table II] (quadruped: 2)
+    heads: 4                  # [Table II] (quadruped: 8)
+    mlp_hidden_size_factor: 4 # -> 256 hidden [Table II]
+    mask: causal
+
+reward:
+  attention:
+    layers: 1                 # [Table II]
+    heads: 1                  # [Table II] (quadruped: 4)
+    mlp_hidden_size_factor: 4 # -> 256 hidden [Table II]
+    mask:                     # causal or leave empty
+  decoder:
+    layers: 0
+    mlp_hidden_size_factor: 2
+
+value:
+  attention:
+    layers: 1                 # [Table II]
+    heads: 1                  # [Table II] (quadruped: 4)
+    mlp_hidden_size_factor: 4 # -> 256 hidden [Table II]
+    mask:                     # causal or leave empty
+  decoder:
+    layers: 0
+    mlp_hidden_size_factor: 2
+
+# Base policy: warm-starts MPPI. For manip its decoder query is LEARNED TEMPORAL
+# EMBEDDINGS (not fut_cmds, since cmd_dim=0) -- see manipulation_port.md 3.2.
+policy:
+  attention:
+    layers: 4                 # [Table II] (same as quadruped)
+    heads: 8                  # [Table II] (same as quadruped)
+    mlp_hidden_size_factor: 4 # -> 256 hidden [Table II]
+    mask: causal
+  decoder:
+    layers: 0
+    mlp_hidden_size_factor: 2

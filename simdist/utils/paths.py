@@ -19,6 +19,7 @@ _FILENAMES = {
     "START_IDXS_FILE_NAME": "start_idxs.hdf5",
     "PROPRIO_OBS_FILE_NAME": "proprio_obs.hdf5",
     "EXTERO_OBS_FILE_NAME": "extero_obs.hdf5",
+    "IMAGES_FILE_NAME": "images.hdf5",
     "ACTIONS_FILE_NAME": "acts.hdf5",
     "COMMANDS_FILE_NAME": "cmds.hdf5",
     "REWARDS_FILE_NAME": "rewards.hdf5",
@@ -173,6 +174,11 @@ def get_proprio_obs_path(processed_data_dir: str):
 def get_extero_obs_path(processed_data_dir: str):
     """Get the path for the exteroceptive observations file."""
     return os.path.join(processed_data_dir, _FILENAMES["EXTERO_OBS_FILE_NAME"])
+
+
+def get_images_path(processed_data_dir: str):
+    """Get the path for the image observations file (JPEG-passthrough, manip)."""
+    return os.path.join(processed_data_dir, _FILENAMES["IMAGES_FILE_NAME"])
 
 
 def get_actions_path(processed_data_dir: str):

@@ -90,6 +90,26 @@ def dataset_batch_to_jax(batch: DatasetBatch) -> DatasetBatch:
     return _numpy_dict_to_jax(batch)
 
 
+def maybe_load_pretrained_encoder(model: nnx.Module, cfg: dict) -> None:
+    """Load ImageNet-pretrained ResNet-18 weights into the encoder backbone when the
+    model config asks for them (``model.encoder.extero_obs.resnet.pretrained ==
+    "imagenet"``). No-op for models without a ResNet encoder (e.g. Go2). Kept out of
+    ``__init__`` so model construction stays torch-free; only called for a freshly
+    created model, never when resuming (the checkpoint already holds the weights)."""
+    enc_cfg = cfg["model"].get("encoder", {}) or {}
+    resnet_cfg = (enc_cfg.get("extero_obs", {}) or {}).get("resnet", {}) or {}
+    if resnet_cfg.get("pretrained") != "imagenet":
+        return
+    encoder = getattr(model, "encoder", None)
+    backbone = getattr(encoder, "resnet", None)
+    if backbone is None:
+        return
+    from simdist.modeling import resnet as resnet_mod
+
+    print("Loading ImageNet-pretrained ResNet-18 weights into the encoder backbone...")
+    resnet_mod.load_torchvision_resnet18(backbone)
+
+
 def repeat_along_batch_dim(x: T, B: int) -> T:
     """Repeat the input array or dict of arrays along the batch dimension B."""
     return cast(

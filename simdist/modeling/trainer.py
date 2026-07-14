@@ -116,6 +116,8 @@ def train(cfg: dict):
         model = models.get_model(
             cfg, scaler_params, rngs=nnx.Rngs(cfg["training"]["seed"])
         )
+        # Vision encoders (manip) start from ImageNet weights; no-op otherwise.
+        model_utils.maybe_load_pretrained_encoder(model, cfg)
 
         # get scaler params structure to store it later
         struct = {}
@@ -154,14 +156,45 @@ def train(cfg: dict):
     print(f"Total parameters: {model_utils.count_params(model)}")
 
     # set up optimizer and metrics
+    train_cfg = cfg["training"]
+    # Absolute warmup_steps/decay_steps are sized for the full (massive) dataset. On a
+    # smaller dataset the whole run can finish inside `warmup_steps`, so the LR never
+    # ramps or decays. `warmup_ratio`/`decay_ratio` (if set) express the schedule as a
+    # fraction of the ACTUAL total steps so it adapts to the dataset/epoch count.
+    total_steps = max_steps or (train_cfg["num_epochs"] * len(train_set))
+    warmup_ratio = train_cfg.get("warmup_ratio")
+    decay_ratio = train_cfg.get("decay_ratio")
+    warmup_steps = (
+        int(warmup_ratio * total_steps)
+        if warmup_ratio is not None
+        else train_cfg["warmup_steps"]
+    )
+    decay_steps = (
+        int(decay_ratio * total_steps)
+        if decay_ratio is not None
+        else train_cfg["decay_steps"]
+    )
+    print(
+        f"LR schedule: total_steps={total_steps} warmup_steps={warmup_steps} "
+        f"decay_steps={decay_steps} peak={train_cfg['learning_rate']}"
+    )
     lr_sched = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
-        peak_value=cfg["training"]["learning_rate"],
-        warmup_steps=cfg["training"]["warmup_steps"],
-        decay_steps=cfg["training"]["decay_steps"],
-        end_value=cfg["training"]["end_learning_rate"],
+        peak_value=train_cfg["learning_rate"],
+        warmup_steps=warmup_steps,
+        decay_steps=decay_steps,
+        end_value=train_cfg["end_learning_rate"],
     )
-    optimizer = nnx.Optimizer(model, optax.adam(lr_sched), wrt=filt)
+    # Optional gradient clipping (global-norm). A moving, unnormalized latent-dynamics
+    # target can spike on a bad batch and permanently inflate the latent scale; clipping
+    # bounds that. Off by default (grad_clip_norm=None) -> Go2 behaviour unchanged.
+    grad_clip_norm = train_cfg.get("grad_clip_norm")
+    if grad_clip_norm is not None:
+        tx = optax.chain(optax.clip_by_global_norm(grad_clip_norm), optax.adam(lr_sched))
+        print(f"Gradient clipping enabled: global-norm {grad_clip_norm}")
+    else:
+        tx = optax.adam(lr_sched)
+    optimizer = nnx.Optimizer(model, tx, wrt=filt)
     metrics = nnx.MultiMetric(
         loss=nnx.metrics.Average("loss"),
         **{k: nnx.metrics.Average(k) for k in loss_fn.loss_terms},
@@ -179,7 +212,7 @@ def train(cfg: dict):
         grad_fn = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)
         (loss, losses), grads = grad_fn(model, x, y, False)
         metrics.update(loss=loss, **losses)
-        optimizer.update(grads)
+        optimizer.update(model, grads)  # flax >=0.11 requires (model, grads)
         return loss
 
     @nnx.jit

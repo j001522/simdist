@@ -16,11 +16,17 @@ data:
 training:
   num_epochs: 2
   max_steps:  # will train until num_epochs, or max_steps (if given), whichever is first
-  eval_interval: 10000  # evaluates and checkpoints at this interval
+  eval_interval: 1000  # evaluates and checkpoints at this interval
   learning_rate: 0.0002
-  warmup_steps: 10000
-  decay_steps: 400000
+  warmup_steps: 10000    # absolute; sized for the full dataset
+  decay_steps: 400000    # absolute; sized for the full dataset
+  # For smaller datasets set these fractions instead — the schedule is then derived
+  # from the actual total steps (num_epochs * steps_per_epoch, or max_steps). Leave
+  # null to use the absolute warmup_steps/decay_steps above.
+  warmup_ratio:          # e.g. 0.05
+  decay_ratio:           # e.g. 1.0 (cosine-decay over the whole run)
   end_learning_rate: 0.0001
+  grad_clip_norm:        # e.g. 1.0 to clip grads by global norm; null = off
   batch_size: 512
   training_data_ratio: 0.998  # portion of dataset to use for training; the rest is used for evaluation
   seed: 42
