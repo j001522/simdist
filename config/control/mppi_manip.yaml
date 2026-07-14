@@ -1,0 +1,33 @@
+# MPPI parameters for manipulation (UR5e peg insertion).
+# Values from simdist_paper.tex tab:mppi_manip (app:manip). The default mppi.yaml
+# holds the quadruped values; the two differ well beyond a retune -- manipulation
+# leans much harder on the base-policy warm start (100 of 350 trajectories vs
+# 22 of 472) and refines less (3 solver iterations vs 8).
+#
+# Paper's "candidate actions batch size" = num_samples; its "noised base policy
+# actions batch size" = num_samples * mixture_coef. 250 * 0.4 = 100.
+num_samples: 250
+mixture_coef: 0.4
+iterations: 3
+delay: 1  # not in the paper table; code-side, must be > 0
+min_std: 0.05
+base_act_std: 0.1
+init_std: 1.0
+num_elites: 64
+temperature: 0.4
+momentum: 0.0
+discount: 0.99
+seed: 42
+
+# NOTE: these three stds are scalars applied to all 7 action dims, and MPPI plans
+# in RAW action units (the model scales fut_acts internally and unscales the policy
+# head output). Two known problems, deliberately left alone for now so the effect of
+# this config change stays isolated:
+#   1. dim 6 (gripper) is binary and was generated with min_noise = max_noise = 0,
+#      so the world model has never seen a perturbed gripper action; MPPI will
+#      still sample N(0, init_std) into it.
+#   2. our measured per-dim raw action std is 2-5 and unequal across dims, so a
+#      single scalar sits outside the data-generation noise envelope for some dims
+#      (drz) and under-explores others (dz).
+# Fix is per-dim std vectors calibrated against the actions envelope in
+# config/system/ur5e.yaml. See the mppi-manip branch discussion.
