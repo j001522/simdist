@@ -49,6 +49,7 @@ simulation_app = app_launcher.app
 import hydra  # noqa: E402
 from omegaconf import DictConfig, OmegaConf  # noqa: E402
 import numpy as np  # noqa: E402
+import gymnasium as gym  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 import torch  # noqa: E402
 from isaaclab.envs import ManagerBasedRLEnv  # noqa: E402
@@ -124,9 +125,11 @@ class Ur5eSim:
             mppi_host, mppi_port, ckpt_dir, self.cfg["control"]
         )
 
-        self.env = self.build_env()
-        # live insertion metrics (same term probe_recorder_episode.py reads)
-        self.progress = self.env.reward_manager.get_term_cfg("progress_context").func
+        self.raw_env, self.env = self.build_env()
+        # live insertion metrics (same term probe_recorder_episode.py reads).
+        # Read managers off raw_env: with --video, self.env is a RecordVideo wrapper.
+        self.progress = self.raw_env.reward_manager.get_term_cfg("progress_context").func
+        self.device = self.raw_env.device
 
         self.obs_dict, _ = self.env.reset()
 
@@ -159,7 +162,22 @@ class Ur5eSim:
         # an hdf5 and query a critic this env has no checkpoint for).
         env_cfg.recorders = RecorderManagerBaseCfg()
 
-        return ManagerBasedRLEnv(env_cfg)
+        # offscreen render + RecordVideo wrapper if --video
+        render_mode = "rgb_array" if args.video else None
+        raw_env = ManagerBasedRLEnv(env_cfg, render_mode=render_mode)
+        env = raw_env
+        if args.video:
+            vdir = args.video_dir or os.path.join(os.getcwd(), "videos")
+            os.makedirs(vdir, exist_ok=True)
+            env = gym.wrappers.RecordVideo(
+                raw_env,
+                video_folder=vdir,
+                step_trigger=lambda s: s == 0,
+                video_length=args.video_length,
+                disable_logger=True,
+            )
+            print(f"[video] recording {args.video_length} steps to {vdir}", flush=True)
+        return raw_env, env
 
     def get_obs(self):
         """proprio (proprio_dim,) float32 and images (n_cam, 224, 224, 3) uint8."""
@@ -217,7 +235,7 @@ class Ur5eSim:
             grip.append(float(action[6]))
 
             action_torch = torch.from_numpy(np.asarray(action, dtype=np.float32))
-            action_torch = action_torch.unsqueeze(0).to(self.env.device)
+            action_torch = action_torch.unsqueeze(0).to(self.device)
             self.obs_dict, reward, terminated, truncated, _ = self.env.step(action_torch)
 
             dist, succ = self.insertion_metrics()
