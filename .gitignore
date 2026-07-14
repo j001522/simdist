@@ -223,3 +223,10 @@ wandb/
 outputs/
 checkpoints/
 go2_ros2_ws/docker/simdist.requirements.txt
+
+*.jpg
+*.png
+*.mp4
+*.gif
+
+lighting_check/

@@ -3,7 +3,8 @@ defaults:
 
 # Name of the RL run under checkpoints/rl/<rl_run> (symlink the Snellius run dir
 # here; export_policies writes policies/ and critics/ inside it).
-rl_run:
+# 5 Hz expert (decimation 24); record env matches via Ur5eRecordEnvCfg.decimation=24.
+rl_run: omnireset_2026-07-01_16-31-09
 envs: 256       # parallel envs; rendering 3 cameras is heavy, keep modest
 steps: 5000    # total env steps; trajectories accumulate as episodes reset (default 25000)
 seed: 42
@@ -20,7 +21,7 @@ simplify:
   reset_types: [GraspedVertHigh]
   probs: [1.0]
 
-expert: 1700  # iteration number of the expert policy (best t0+t2, tied-best overall ~0.90)
+expert: 1600  # 5Hz run's evaluated checkpoint (success 0.8877; eval_model_1600.json)
 expert_prob: 0.5  # reset with a sub-optimal checkpoint with prob 0.5 (paper)
 
 # Sub-optimal policy checkpoints (paper: saved every 100 up to checkpoint 1000).

@@ -35,6 +35,9 @@ from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.d
 from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.rl_state_cfg import (  # noqa: E501
     ObservationsCfg as StateObservationsCfg,
 )
+from uwlab_tasks.manager_based.manipulation.omnireset.config.ur5e_robotiq_2f85.actions import (  # noqa: E501
+    Ur5eRobotiq2f85RelativeOSCAction,
+)
 
 
 class ManagerBasedRLEnvRecord(ManagerBasedRLEnv):
@@ -165,3 +168,28 @@ class Ur5eRecordEnvCfg(Ur5eRobotiq2f85DataCollectionRGBRelCartesianOSCCfg):
         self.episode_length_s = 16.0
         self.terminations.success = None
         self.terminations.early_success = None
+
+        # Match the Stage-1 (base) dynamics the expert was trained + evaluated on.
+        # The RGB data-collection cfg inherits the Stage-2/sim2real stack (eval OSC
+        # action scale with z=0.002 + high Kp, plus randomize_arm_sysid /
+        # randomize_osc_gains that write real-robot friction onto the arm). The
+        # expert (run omnireset_2026-06-21_17-10-39, ~0.90 on State-v0) never
+        # trained through the finetune curriculum, so under that stack it saturates
+        # (|action|~6) and the arm barely moves -> it never seats the peg. Restore
+        # the base OSC action (z-scale 0.02, soft Kp 200/3) and the ideal actuator
+        # (no sysid / OSC-gain DR), exactly as the working State-Play env. Confirmed
+        # to insert (probe_recorder_episode.py). Users stay in sim (no sim2real), so
+        # the finetune dynamics are not needed. See memory: recorder-zero-insertion.
+        self.actions = Ur5eRobotiq2f85RelativeOSCAction()
+        self.events.randomize_arm_sysid = None
+        self.events.randomize_osc_gains = None
+
+        # Match the CONTROL RATE the expert was trained at. The base RlStateCfg runs
+        # decimation=12 @ sim.dt=1/120 -> 10 Hz. The current expert (run
+        # omnireset_2026-07-01_16-31-09) was trained at 5 Hz (decimation doubled to
+        # 24, sim.dt unchanged). The OSC action is a per-control-step delta, so a
+        # decimation mismatch changes the per-step dynamics and breaks the policy
+        # (same failure class as the action-scale/DR mismatch above). Keep this equal
+        # to the training decimation of whatever expert `generate_data.yaml` points at.
+        self.decimation = 24
+        self.sim.render_interval = self.decimation  # one rendered frame per control step
