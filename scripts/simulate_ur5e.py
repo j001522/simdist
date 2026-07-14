@@ -17,6 +17,15 @@ Three things differ from the Go2 harness beyond the obvious obs/action shapes:
     a zero action would command the gripper open and drop the peg.
 
 Cameras require ``--enable_cameras``, which AppLauncher is given below.
+
+NOTE: this single-process script CANNOT run on the DGX Spark -- Isaac's python has
+no JAX, and the GPU JAX stack needs numpy>=2 while IsaacLab needs numpy<2, so they
+cannot share one interpreter. On the Spark use the 2-process harness instead:
+
+    scripts/remote/run_ur5e.sh model.checkpoint=<run> --headless
+
+This file remains the reference for any environment where one python has both
+(and is the exact loop scripts/remote/simulate_ur5e_remote.py mirrors).
 """
 
 import argparse
