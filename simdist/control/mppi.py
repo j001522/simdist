@@ -58,9 +58,13 @@ class MppiController(ControllerBase):
 
     def run_control(self) -> ControllerOutput:
         model_inputs = self._make_model_inputs(self.dummy_actions)
-        base_policy_actions = self._get_base_policy_actions(model_inputs)
+        # The encoder output does not depend on the candidate actions, so it is computed
+        # once here and reused by every sampled trajectory in every solver iteration.
+        encoding = self._encode(model_inputs)
+        fut_cmds = jnp.asarray(model_inputs["fut_cmds"])
+        base_policy_actions = self._get_base_policy_actions(encoding, fut_cmds)
         self.mppi_state = self._mppi_step(
-            self.mppi_state, base_policy_actions, model_inputs
+            self.mppi_state, base_policy_actions, encoding, fut_cmds
         )
         actions = self.mppi_state.mean
         output: ControllerOutput = {"actions": np.array(actions)}
@@ -85,11 +89,28 @@ class MppiController(ControllerBase):
         return model_inputs
 
     @functools.partial(nnx.jit, static_argnames=["self"])
-    def _get_base_policy_actions(
+    def _encode(
         self, model_inputs: types.WorldModelSchema.Inputs
+    ) -> types.WorldModelSchema.Encoding:
+        """Encode the current observation once, at batch size 1."""
+        return self.model.encode_context(repeat_along_batch_dim(model_inputs, 1))
+
+    def _broadcast_encoding(
+        self, encoding: types.WorldModelSchema.Encoding, batch_size: int
+    ) -> types.WorldModelSchema.Encoding:
+        """Expand a batch-1 encoding to the sample batch. This is a broadcast of a
+        (2H+1, latent_dim) tensor, not of the raw observation -- which is the whole
+        point: for manipulation the images never reach the sample batch dimension."""
+        return jax.tree.map(
+            lambda z: jnp.broadcast_to(z, (batch_size,) + z.shape[1:]), encoding
+        )
+
+    @functools.partial(nnx.jit, static_argnames=["self"])
+    def _get_base_policy_actions(
+        self, encoding: types.WorldModelSchema.Encoding, fut_cmds: jnp.ndarray
     ) -> jnp.ndarray:
-        model_inputs = repeat_along_batch_dim(model_inputs, 1)
-        model_outputs = self.model.inference(model_inputs)
+        x = {"fut_acts": self.dummy_actions[None], "fut_cmds": fut_cmds[None]}
+        model_outputs = self.model.inference_from_encoding(x, encoding)
         return model_outputs["actions"][0]
 
     @functools.partial(nnx.jit, static_argnames=["self"])
@@ -97,10 +118,19 @@ class MppiController(ControllerBase):
         self,
         mppi_state: MppiState,
         base_policy_actions: jnp.ndarray,
-        model_inputs: types.WorldModelSchema.Inputs,
+        encoding: types.WorldModelSchema.Encoding,
+        fut_cmds: jnp.ndarray,
         **kwargs,
     ) -> MppiState:
         key = self._to_key(mppi_state.key_data)
+
+        # the sample batch is fixed across solver iterations, so broadcast the encoding
+        # and commands once, outside the scan
+        batch_size = self.ctrl_cfg["num_samples"] + self.num_base_trajs
+        batch_encoding = self._broadcast_encoding(encoding, batch_size)
+        batch_fut_cmds = jnp.broadcast_to(
+            fut_cmds[None], (batch_size,) + fut_cmds.shape
+        )
 
         # add noise to base actions
         key, key_base_act = jax.random.split(key)
@@ -131,9 +161,8 @@ class MppiController(ControllerBase):
             noised_acts = mean + act_noise
             # run model with both base policy and noised actions
             acts = jnp.concatenate([noised_acts, noised_base_policy_actions], axis=0)
-            x = repeat_along_batch_dim(model_inputs, acts.shape[0])
-            x["fut_acts"] = acts
-            y = self.model.inference(x)
+            x = {"fut_acts": acts, "fut_cmds": batch_fut_cmds}
+            y = self.model.inference_from_encoding(x, batch_encoding)
             returns = self._calc_returns(y)
 
             # select elites
