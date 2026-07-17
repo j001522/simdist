@@ -46,7 +46,7 @@ def _install_stubs() -> None:
 
 
 def build_controller(simdist_dir: str, ckpt_dir: str, ctrl_cfg: dict,
-                     restore: bool = True):
+                     restore: bool = True, ckpt_step: int | None = None):
     sys.path.insert(0, simdist_dir)
     import flax.nnx as nnx
     from omegaconf import OmegaConf
@@ -58,7 +58,10 @@ def build_controller(simdist_dir: str, ckpt_dir: str, ctrl_cfg: dict,
     if restore:
         # tolerant restore (handles old-flax rng-state nesting); loads the
         # trained weights + scaler params so the policy actually controls.
-        model, model_cfg, step = mu.load_model_from_ckpt(ckpt_dir)
+        # ckpt_step=None loads the latest step; pass a step to pin a specific
+        # checkpoint (the run is not monotonic across steps -- pick by the
+        # planning probe, not by latest).
+        model, model_cfg, step = mu.load_model_from_ckpt(ckpt_dir, ckpt_step)
         print(f"[mppi_server] restored trained weights (step {step})", flush=True)
     else:
         model_cfg = OmegaConf.to_container(
@@ -80,6 +83,8 @@ def main() -> None:
     ap.add_argument("--simdist-dir", default="/shared/giacomo/simdist")
     ap.add_argument("--fresh", action="store_true",
                     help="Skip checkpoint restore (random-init weights).")
+    ap.add_argument("--ckpt-step", type=int, default=None,
+                    help="Pin a specific checkpoint step (default: latest).")
     args = ap.parse_args()
 
     # Bind the port BEFORE the slow jax import so readiness probes / the client
@@ -101,9 +106,14 @@ def main() -> None:
         if op == "build":
             state["controller"] = build_controller(
                 args.simdist_dir, msg["ckpt_dir"], msg["ctrl_cfg"],
-                restore=not args.fresh)
+                restore=not args.fresh, ckpt_step=args.ckpt_step)
             print("[mppi_server] controller built", flush=True)
             return {"ok": True}
+        if op == "echo":
+            # IPC-plumbing test: round-trip an externally-computed action (e.g. the
+            # expert) through the same serialize/send/recv path MPPI actions take, with
+            # no model involved. Confirms the split process doesn't corrupt actions.
+            return {"ok": True, "out": {"actions": msg["actions"]}}
         c = state["controller"]
         if c is None:
             return {"ok": False, "err": "controller not built"}

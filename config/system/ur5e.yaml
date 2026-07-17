@@ -54,6 +54,13 @@ actions:
   - name: ee_drz
     min_noise: 0.05
     max_noise: 1.2
+  # Nonzero gripper noise is REQUIRED for the value head: with zero noise the
+  # data contains no "open the gripper -> drop the peg" counterfactual, the WM
+  # learns open=>high value, and MPPI exploits it (the frozen_action_dims hack
+  # in mppi.py exists only to mask this). Expert |gripper| action ~2.5 and the
+  # binary action thresholds at 0, so sigma=2.5 flips ~16% of noised steps at
+  # the top of the per-env draw; transient 1-step opens don't release the peg
+  # (the expert itself emits them on ~7% of steps), only sustained opens do.
   - name: gripper
-    min_noise: 0.0
-    max_noise: 0.0
+    min_noise: 0.1
+    max_noise: 2.5

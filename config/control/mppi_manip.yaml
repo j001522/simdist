@@ -33,16 +33,25 @@ seed: 42
 # The real fix is non-zero gripper noise in config/system/ur5e.yaml + regenerate + retrain.
 frozen_action_dims: []
 
+# Execution-path isolation test. true = bypass MPPI search and command the base-policy
+# head (expert distillation, corr 0.94 offline) directly. If the arm then reaches/inserts,
+# the obs->action->env path is sound and the fault is MPPI's search/model evaluation; if it
+# still fails, the harness execution path is the bug. Default false (normal MPPI).
+base_policy_only: false
+
 # Weight on the terminal value term in the planning return. 1.0 = paper behaviour.
 #
-# Set to 0.0 to plan on the 5-step reward horizon alone. DIAGNOSTIC: the expert critic
-# used for data generation emits value targets that are UNCORRELATED with the true
-# discounted return-to-go computed from the recorded rewards (corr -0.01), and rank a
-# seated peg BELOW an unseated one at every episode phase. The world model's value head
-# reproduces those targets faithfully (corr 0.92), so the terminal value actively pushes
-# the planner away from insertion. The reward head is sound (corr 0.86) and the reward is
-# dense (progress_context + ee_asset_distance + dense_success), so reward-only planning
-# still has a gradient to follow. Restore to 1.0 once the critic is fixed.
+# WARNING: at 1.0 the value is a LIFT ATTRACTOR. The value FAITHFULLY regresses its
+# targets (per-episode corr with return-to-go +0.59) BUT those targets are mis-shaped for
+# planning: measured on expert data, both recorded V^e and the value head RISE with peg
+# height (corr +0.47 / +0.54), because the dense-shaped reward
+# (progress + ee_distance + dense_success at 0.1) makes return-to-go larger when more
+# approach remains (peg high), while the sparse success term (1.0) that should make
+# "inserted" highest-value is swamped (~0.2 vs ~3-4). So MPPI maximizing this value climbs
+# UP, on-manifold, before any OOD extrapolation. value_weight=0 stops the lift (removes the
+# attractor) but leaves only the weak reward signal (spread 0.023) -> drifts. Neither weight
+# works; the real fix is a sparse-dominant reward / recomputed value targets + retrain.
+# See diag_value_vs_height.py and [[wm-sole-bottleneck]].
 value_weight: 1.0
 
 # NOTE: these three stds are scalars applied to all 7 action dims, and MPPI plans

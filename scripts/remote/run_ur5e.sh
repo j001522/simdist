@@ -13,6 +13,8 @@
 #   record offscreen:
 #     ./run_ur5e.sh model.checkpoint=wm_manip_5hz_ln --headless --video --video_length 400
 # Env:    PORT (default 5599)
+#         CKPT_STEP (default: latest) -- pin a specific checkpoint step, e.g.
+#           CKPT_STEP=49000 ./run_ur5e.sh model.checkpoint=wm_manip_5hz_ln --headless
 #
 # Cameras are always enabled (the world model is vision-based), so unlike the Go2
 # runner this costs render time even headless.
@@ -24,9 +26,13 @@ SIMDIST="$(cd "$HERE/../.." && pwd)"
 JAX_PY="${JAX_PY:-/shared/giacomo/jax_spark_test/bin/python}"
 ISAAC_PY="${ISAAC_PY:-/shared/giacomo/isaac/IsaacSim/_build/linux-aarch64/release/python.sh}"
 PORT="${PORT:-5599}"
+CKPT_STEP="${CKPT_STEP:-}"
 
-echo "[run] starting MPPI server (Process B, JAX/GPU) on port $PORT ..."
-"$JAX_PY" "$HERE/mppi_server.py" --port "$PORT" --simdist-dir "$SIMDIST" &
+CKPT_STEP_ARG=()
+[ -n "$CKPT_STEP" ] && CKPT_STEP_ARG=(--ckpt-step "$CKPT_STEP")
+
+echo "[run] starting MPPI server (Process B, JAX/GPU) on port $PORT ${CKPT_STEP:+(step $CKPT_STEP)}..."
+"$JAX_PY" "$HERE/mppi_server.py" --port "$PORT" --simdist-dir "$SIMDIST" "${CKPT_STEP_ARG[@]}" &
 SERVER_PID=$!
 trap 'echo "[run] stopping server ($SERVER_PID)"; kill "$SERVER_PID" 2>/dev/null || true' EXIT
 

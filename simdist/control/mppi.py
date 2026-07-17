@@ -66,6 +66,20 @@ class MppiController(ControllerBase):
         # critic is fixed.
         self.value_weight = float(self.ctrl_cfg.get("value_weight", 1.0))
 
+        # Execution-path isolation test. When true, skip the MPPI search entirely and
+        # command the base-policy head's own output (a distillation of the expert, corr
+        # 0.94 offline). The obs->action->env path is identical to a normal run, so:
+        #   reaches/inserts  => execution path is fine, fault is MPPI search/model eval
+        #   still fails       => execution/harness bug (obs wiring or action unscaling),
+        #                        since the head is known-good offline.
+        self.base_policy_only = bool(self.ctrl_cfg.get("base_policy_only", False))
+        if self.base_policy_only:
+            print(
+                "[mppi] BASE-POLICY-ONLY: MPPI search bypassed, commanding the "
+                "base-policy head directly (execution-path isolation test)",
+                flush=True,
+            )
+
         frozen = self.ctrl_cfg.get("frozen_action_dims") or []
         self.frozen_dims = list(frozen)
         # multiplicative noise mask: 0 on frozen dims, 1 elsewhere
@@ -96,6 +110,9 @@ class MppiController(ControllerBase):
         encoding = self._encode(model_inputs)
         fut_cmds = jnp.asarray(model_inputs["fut_cmds"])
         base_policy_actions = self._get_base_policy_actions(encoding, fut_cmds)
+        if self.base_policy_only:
+            # bypass the search; command the expert distillation directly
+            return {"actions": np.array(base_policy_actions)}
         self.mppi_state = self._mppi_step(
             self.mppi_state, base_policy_actions, encoding, fut_cmds
         )

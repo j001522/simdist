@@ -35,6 +35,21 @@ parser.add_argument("--video", action="store_true",
                     help="Record a video offscreen (works headless / no display).")
 parser.add_argument("--video_length", type=int, default=400)
 parser.add_argument("--video_dir", default=None)
+# Control experiments: drive the env with the DATA-COLLECTION expert instead of MPPI.
+#   --expert              : run the expert directly in-process (no server) -> tests the
+#                           env + reset config (the insertion ceiling).
+#   --expert --via-server : round-trip the expert action through the server's echo op ->
+#                           tests the 2-process IPC plumbing with known-good actions.
+parser.add_argument("--expert", action="store_true",
+                    help="Drive the env with the data-collection expert, not MPPI.")
+parser.add_argument("--expert-run", default="omnireset_2026-07-01_16-31-09",
+                    help="rsl_rl run dir holding the expert checkpoint (the expert that "
+                         "generated the current dataset: eval success 0.89 at iter 1600).")
+parser.add_argument("--expert-iter", type=int, default=1600,
+                    help="Expert checkpoint iteration.")
+parser.add_argument("--via-server", action="store_true",
+                    help="With --expert: send each action through the server echo op "
+                         "(IPC-plumbing test). Without it the expert runs in-process.")
 AppLauncher.add_app_launcher_args(parser)
 args, unknown = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + unknown  # keep only unknown args for hydra
@@ -66,9 +81,10 @@ class RemoteController:
     """Mirrors the ControllerBase interface used by the sim loop, forwarding each
     call to the MPPI server over a socket. Holds no JAX state itself."""
 
-    def __init__(self, host, port, ckpt_dir, ctrl_cfg):
+    def __init__(self, host, port, ckpt_dir, ctrl_cfg, build=True):
         self.sock = socket.create_connection((host, port))
-        self._call({"op": "build", "ckpt_dir": ckpt_dir, "ctrl_cfg": ctrl_cfg})
+        if build:
+            self._call({"op": "build", "ckpt_dir": ckpt_dir, "ctrl_cfg": ctrl_cfg})
 
     def _call(self, msg):
         ipc.send_msg(self.sock, msg)
@@ -88,6 +104,10 @@ class RemoteController:
 
     def run_control(self):
         return self._call({"op": "run_control"})["out"]
+
+    def echo(self, actions):
+        """Round-trip an action list through the server unchanged (IPC test)."""
+        return self._call({"op": "echo", "actions": actions})["out"]["actions"]
 
     def close(self):
         try:
@@ -120,10 +140,18 @@ class Ur5eSim:
         cmd_dim = config.cmd_dim_from_sys_config(sys_cfg)
         assert cmd_dim == 0, f"simulate_ur5e assumes cmd_dim == 0; got {cmd_dim}"
 
-        # create the remote controller (connects to the MPPI server)
-        self.controller = RemoteController(
-            mppi_host, mppi_port, ckpt_dir, self.cfg["control"]
-        )
+        # create the remote controller (connects to the MPPI server). Skipped entirely
+        # when running the expert in-process; echo-only (no model build) when the expert
+        # is routed through the server for the IPC-plumbing test.
+        self.controller = None
+        if not args.expert:
+            self.controller = RemoteController(
+                mppi_host, mppi_port, ckpt_dir, self.cfg["control"]
+            )
+        elif args.via_server:
+            self.controller = RemoteController(
+                mppi_host, mppi_port, ckpt_dir, None, build=False
+            )
 
         self.raw_env, self.env = self.build_env()
         # live insertion metrics (same term probe_recorder_episode.py reads).
@@ -133,12 +161,25 @@ class Ur5eSim:
 
         self.obs_dict, _ = self.env.reset()
 
+        # load the data-collection expert (Process A has torch; consumes the privileged
+        # "policy" obs group, same as generate_data / render_expert_episode).
+        self.expert = None
+        if args.expert:
+            from simdist.utils.torch import get_actor_critic_from_iteration
+            self.expert, _ = get_actor_critic_from_iteration(
+                args.expert_run, args.expert_iter, self.device
+            )
+            mode = "via server echo" if args.via_server else "direct in-process"
+            print(f"[expert] loaded {args.expert_run} iter {args.expert_iter} "
+                  f"({mode})", flush=True)
+
         # cmd is zero-width for manipulation
         self.zero_cmd = np.zeros((0,), dtype=np.float32)
         self.zero_action = np.zeros((self.act_dim,), dtype=np.float32)
-        x = self.get_controller_input(self.zero_action)
-        self.controller.initialize(x, self.zero_cmd)
-        self.controller.reset(x, self.zero_cmd)
+        if self.expert is None:
+            x = self.get_controller_input(self.zero_action)
+            self.controller.initialize(x, self.zero_cmd)
+            self.controller.reset(x, self.zero_cmd)
 
         self.pbar = tqdm(desc="Simulation", unit="step",
                          total=self.num_episodes * self.max_steps)
@@ -210,7 +251,8 @@ class Ur5eSim:
                 break
             self.run_episode(ep)
         self.logging()
-        self.controller.close()
+        if self.controller is not None:
+            self.controller.close()
         self.env.close()
         simulation_app.close()
 
@@ -218,7 +260,8 @@ class Ur5eSim:
         self.obs_dict, _ = self.env.reset()
         last_action = self.zero_action.copy()
         # refill the controller history with the post-reset observation
-        self.controller.reset(self.get_controller_input(last_action), self.zero_cmd)
+        if self.expert is None:
+            self.controller.reset(self.get_controller_input(last_action), self.zero_cmd)
 
         succeeded = False
         min_dist = np.inf
@@ -228,9 +271,18 @@ class Ur5eSim:
         done = False
 
         while not done and step < self.max_steps and simulation_app.is_running():
-            self.controller.update(self.get_controller_input(last_action))
-
-            action = self.controller.run_control()["actions"][0]  # first planned step
+            if self.expert is not None:
+                # data-collection expert: consumes privileged "policy" obs, no scaling
+                with torch.no_grad():
+                    action = (self.expert(self.obs_dict["policy"])[0]
+                              .detach().cpu().numpy().astype(np.float32))
+                if args.via_server:
+                    # same serialize/send/recv path MPPI actions take, model bypassed
+                    action = np.asarray(self.controller.echo(action.tolist()),
+                                        dtype=np.float32)
+            else:
+                self.controller.update(self.get_controller_input(last_action))
+                action = self.controller.run_control()["actions"][0]  # first planned step
             last_action = action
             grip.append(float(action[6]))
 

@@ -9,11 +9,14 @@ envs: 256       # parallel envs; rendering 3 cameras is heavy, keep modest
 steps: 5000    # total env steps; trajectories accumulate as episodes reset (default 25000)
 seed: 42
 
-# Simplified single-nominal task (ur5e only): all domain randomization off,
-# dynamics pinned to the sysid nominal, one grasped reset bank. Shrinks the
-# data-hungry world model's manifold for cheap pipeline validation. Set
-# enabled: false to record under the full DR distribution again. Widen
-# reset_types (e.g. add GraspedVertLow, probs [0.5, 0.5]) if the WM underfits.
+# Simplified single-nominal task (ur5e only): every DR event PINNED to a
+# deterministic in-training-range value (never nulled -- nulled physics events
+# left the critic obs OOD and poisoned the recorded values, see memory:
+# value-target-inverted), dynamics at the sysid nominal, one grasped reset
+# bank. Gate before collecting: expert 0.971/512 eps, critic V +18->+21
+# monotone (experiments/value_target_analysis). Set enabled: false to record
+# under the full DR distribution again. Widen reset_types (e.g. add
+# GraspedVertLow, probs [0.5, 0.5]) if the WM underfits.
 # Banks come from experiments/ood_insertion/build_reset_banks.py.
 simplify:
   enabled: true
