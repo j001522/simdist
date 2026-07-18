@@ -31,7 +31,15 @@ seed: 42
 # unaffected -- it reproduces the expert gripper at corr 0.94 -- so pinning dim 6 to it
 # isolates the arm dims and lets the rest of the loop be evaluated.
 # The real fix is non-zero gripper noise in config/system/ur5e.yaml + regenerate + retrain.
+# UPDATE 2026-07-18 (post gripper-noise dataset 2026-07-16, ckpt wm_manip_24708772):
+# probe_wm_heads.py shows the noise did not cure this, because the expert ITSELF opens
+# the gripper at 2-5cm (57% of its gripper commands there; release-to-insert strategy).
+# The heads faithfully learn open-near-hole => good and MPPI opens on approach; the base
+# head reproduces the same opens, so pinning to it no longer protects. Set
+# frozen_action_value to pin the frozen dims to a constant instead (e.g. -2.5 = hold
+# the gripper closed all episode); null = pin to the base-policy head as before.
 frozen_action_dims: []
+frozen_action_value: null
 
 # Execution-path isolation test. true = bypass MPPI search and command the base-policy
 # head (expert distillation, corr 0.94 offline) directly. If the arm then reaches/inserts,

@@ -46,24 +46,23 @@ class MppiController(ControllerBase):
         self.rngs = nnx.Rngs(self.ctrl_cfg["seed"])
         self.dummy_actions = jnp.zeros((self.T, self.act_dim))
 
-        # Action dims excluded from planning: they are not perturbed and are pinned to
-        # the base policy's prediction, so the planner cannot move them. Needed when the
-        # reward/value model mis-ranks a dim the base policy nonetheless gets right --
-        # for UR5e that is the gripper (dim 6): the world model was trained with zero
-        # injected gripper noise, so it only ever saw the gripper open in states that
-        # were already successful, and learned open => high value. MPPI exploits that and
-        # drops the peg. The base-policy head is unaffected (it reproduces the expert
-        # gripper at corr 0.94), so pinning the dim to it restores correct behaviour
-        # without retraining. Remove once the value model is trained on gripper
-        # counterfactuals (i.e. with non-zero gripper noise in data generation).
+        # Action dims excluded from planning: they are not perturbed and are pinned
+        # (to the base-policy head, or to frozen_action_value when set), so the
+        # planner cannot move them. For UR5e that is the gripper (dim 6). History:
+        # with zero gripper noise in the data the value model learned open => high
+        # value and pinning to the base head (expert-faithful, corr 0.94) fixed it.
+        # After the 2026-07-16 dataset added gripper noise, probe_wm_heads.py showed
+        # the deeper truth: the OmniReset expert itself opens the gripper at
+        # 2-5cm (57% of its gripper commands there are open -- release-to-insert),
+        # the heads faithfully learn open-near-hole => good, and MPPI generalizes
+        # that into opening during the approach and dropping the peg; the base head
+        # reproduces the same opens, so pinning to it no longer protects. Use
+        # frozen_action_value=-2.5 to hold the gripper closed outright.
         # Weight on the terminal value in the planning return. 1.0 = paper behaviour.
-        # Set to 0.0 to plan on the reward horizon alone -- useful when the transferred
-        # value model is untrustworthy. For UR5e the recorded V^e targets are
-        # uncorrelated with the true discounted return-to-go (corr -0.01), so the value
-        # head, which reproduces them faithfully, feeds MPPI noise that anti-correlates
-        # with insertion. The reward head is sound (corr 0.86 with recorded reward) and
-        # the reward is dense, so reward-only planning is a usable fallback until the
-        # critic is fixed.
+        # Set to 0.0 to plan on the reward horizon alone -- useful when the
+        # transferred value model is untrustworthy. (The 2026-07-16 dataset fixed
+        # the previously-inverted V^e labels; the retrained value head verifies
+        # healthy offline: corr 0.95 to labels, monotone in peg-hole distance.)
         self.value_weight = float(self.ctrl_cfg.get("value_weight", 1.0))
 
         # Execution-path isolation test. When true, skip the MPPI search entirely and
@@ -82,13 +81,27 @@ class MppiController(ControllerBase):
 
         frozen = self.ctrl_cfg.get("frozen_action_dims") or []
         self.frozen_dims = list(frozen)
+        # Optional constant for the frozen dims instead of the base-policy output.
+        # Needed when the base-policy head itself mis-commands the dim (UR5e gripper
+        # after gripper action noise entered the data: labels carry the corruption,
+        # and the head faithfully reproduces the expert's open-near-hole commands,
+        # so pinning to it still drops the peg). E.g. frozen_action_value=-2.5
+        # holds the gripper closed for the whole episode.
+        self.frozen_value = self.ctrl_cfg.get("frozen_action_value")
+        if self.frozen_value is not None:
+            self.frozen_value = float(self.frozen_value)
         # multiplicative noise mask: 0 on frozen dims, 1 elsewhere
         mask = np.ones((self.act_dim,), dtype=np.float32)
         mask[self.frozen_dims] = 0.0
         self.noise_mask = jnp.asarray(mask)
         if self.frozen_dims:
+            target = (
+                f"constant {self.frozen_value}"
+                if self.frozen_value is not None
+                else "the base policy"
+            )
             print(
-                f"[mppi] action dims {self.frozen_dims} frozen to the base policy "
+                f"[mppi] action dims {self.frozen_dims} frozen to {target} "
                 "(not planned over)",
                 flush=True,
             )
@@ -190,6 +203,13 @@ class MppiController(ControllerBase):
             * self.noise_mask
         )
         noised_base_policy_actions = base_policy_actions + base_act_noise
+        # With frozen_action_value the base block must carry the constant too;
+        # otherwise its elites would pull the frozen dims of the mean toward the
+        # base head's output.
+        if self.frozen_value is not None and self.frozen_dims:
+            noised_base_policy_actions = noised_base_policy_actions.at[
+                :, :, self.frozen_dims
+            ].set(self.frozen_value)
 
         # initialize
         prev_mean = mppi_state.mean
@@ -199,9 +219,12 @@ class MppiController(ControllerBase):
         # With zero noise on those dims (noise_mask), every sampled trajectory -- both
         # the candidates and the base-policy block -- then carries this exact value, so
         # the elite-weighted update cannot move it and the planner leaves it alone.
-        mean = mean.at[:, self.frozen_dims].set(
-            base_policy_actions[:, self.frozen_dims]
-        )
+        if self.frozen_value is not None:
+            mean = mean.at[:, self.frozen_dims].set(self.frozen_value)
+        else:
+            mean = mean.at[:, self.frozen_dims].set(
+                base_policy_actions[:, self.frozen_dims]
+            )
         std = jnp.ones((self.T, self.act_dim)) * self.ctrl_cfg["init_std"]
 
         # each iterations do the following
