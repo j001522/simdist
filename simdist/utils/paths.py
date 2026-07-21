@@ -102,6 +102,10 @@ def get_simulate_go2_hydra_config():
     return {"config_path": get_config_dir(), "config_name": "simulate_go2"}
 
 
+def get_simulate_ur5e_hydra_config():
+    return {"config_path": get_config_dir(), "config_name": "simulate_ur5e"}
+
+
 def get_aggregate_realworld_data_hydra_config():
     return {"config_path": get_config_dir(), "config_name": "aggregate_realworld_data"}
 

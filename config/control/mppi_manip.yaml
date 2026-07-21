@@ -1,0 +1,76 @@
+# MPPI parameters for manipulation (UR5e peg insertion).
+# Values from simdist_paper.tex tab:mppi_manip (app:manip). The default mppi.yaml
+# holds the quadruped values; the two differ well beyond a retune -- manipulation
+# leans much harder on the base-policy warm start (100 of 350 trajectories vs
+# 22 of 472) and refines less (3 solver iterations vs 8).
+#
+# Paper's "candidate actions batch size" = num_samples; its "noised base policy
+# actions batch size" = num_samples * mixture_coef. 250 * 0.4 = 100.
+num_samples: 250
+mixture_coef: 0.4
+iterations: 3
+delay: 1  # not in the paper table; code-side, must be > 0
+min_std: 0.05
+base_act_std: 0.1
+init_std: 1.0
+num_elites: 64
+temperature: 0.4
+momentum: 0.0
+discount: 0.99
+seed: 42
+
+# Action dims MPPI may not plan over: not perturbed, pinned to the base policy's
+# prediction. Empty = plan over everything (paper behaviour).
+#
+# Set to [6] to freeze the gripper. DIAGNOSTIC BOOTSTRAP, not a fix: the world model's
+# reward/value heads prefer an OPEN gripper (measured on real frames: predicted return
+# rises monotonically from 1.31 at gripper=-4 to 2.47 at gripper=+2), because data
+# generation injects ZERO gripper noise, so the model only ever saw the gripper open in
+# states that had already succeeded, and learned open => high value. MPPI exploits it and
+# drops the peg on step one (0-16% closed vs the expert's 94%). The base-policy head is
+# unaffected -- it reproduces the expert gripper at corr 0.94 -- so pinning dim 6 to it
+# isolates the arm dims and lets the rest of the loop be evaluated.
+# The real fix is non-zero gripper noise in config/system/ur5e.yaml + regenerate + retrain.
+# UPDATE 2026-07-18 (post gripper-noise dataset 2026-07-16, ckpt wm_manip_24708772):
+# probe_wm_heads.py shows the noise did not cure this, because the expert ITSELF opens
+# the gripper at 2-5cm (57% of its gripper commands there; release-to-insert strategy).
+# The heads faithfully learn open-near-hole => good and MPPI opens on approach; the base
+# head reproduces the same opens, so pinning to it no longer protects. Set
+# frozen_action_value to pin the frozen dims to a constant instead (e.g. -2.5 = hold
+# the gripper closed all episode); null = pin to the base-policy head as before.
+frozen_action_dims: []
+frozen_action_value: null
+
+# Execution-path isolation test. true = bypass MPPI search and command the base-policy
+# head (expert distillation, corr 0.94 offline) directly. If the arm then reaches/inserts,
+# the obs->action->env path is sound and the fault is MPPI's search/model evaluation; if it
+# still fails, the harness execution path is the bug. Default false (normal MPPI).
+base_policy_only: false
+
+# Weight on the terminal value term in the planning return. 1.0 = paper behaviour.
+#
+# WARNING: at 1.0 the value is a LIFT ATTRACTOR. The value FAITHFULLY regresses its
+# targets (per-episode corr with return-to-go +0.59) BUT those targets are mis-shaped for
+# planning: measured on expert data, both recorded V^e and the value head RISE with peg
+# height (corr +0.47 / +0.54), because the dense-shaped reward
+# (progress + ee_distance + dense_success at 0.1) makes return-to-go larger when more
+# approach remains (peg high), while the sparse success term (1.0) that should make
+# "inserted" highest-value is swamped (~0.2 vs ~3-4). So MPPI maximizing this value climbs
+# UP, on-manifold, before any OOD extrapolation. value_weight=0 stops the lift (removes the
+# attractor) but leaves only the weak reward signal (spread 0.023) -> drifts. Neither weight
+# works; the real fix is a sparse-dominant reward / recomputed value targets + retrain.
+# See diag_value_vs_height.py and [[wm-sole-bottleneck]].
+value_weight: 1.0
+
+# NOTE: these three stds are scalars applied to all 7 action dims, and MPPI plans
+# in RAW action units (the model scales fut_acts internally and unscales the policy
+# head output). Two known problems, deliberately left alone for now so the effect of
+# this config change stays isolated:
+#   1. dim 6 (gripper) is binary and was generated with min_noise = max_noise = 0,
+#      so the world model has never seen a perturbed gripper action; MPPI will
+#      still sample N(0, init_std) into it.
+#   2. our measured per-dim raw action std is 2-5 and unequal across dims, so a
+#      single scalar sits outside the data-generation noise envelope for some dims
+#      (drz) and under-explores others (dz).
+# Fix is per-dim std vectors calibrated against the actions envelope in
+# config/system/ur5e.yaml. See the mppi-manip branch discussion.

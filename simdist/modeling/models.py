@@ -187,12 +187,35 @@ class WorldModelBase(ModelBase):
         x: types.WorldModelSchema.Inputs,
         deterministic: bool | None = None,
     ) -> types.WorldModelSchema.Outputs:
-
-        # pre-processing, encoding, and embedding
         x = self.scaler.scale(x)
         self.debug_proprio_scaled_mean.value = x["proprio_obs_hist"].mean()
         self.debug_proprio_scaled_std.value = x["proprio_obs_hist"].std()
-        encoding = self.encoder(x, deterministic=deterministic)
+        encoding = self._encode(x, deterministic=deterministic)
+        return self._predict(x, encoding, deterministic=deterministic)
+
+    def _encode(
+        self,
+        x: types.WorldModelSchema.Inputs,
+        deterministic: bool | None = None,
+    ) -> types.WorldModelSchema.Encoding:
+        """Action-independent half of the forward pass, on already-scaled inputs.
+
+        Reads only ``proprio_obs_hist`` / ``acts_hist`` / ``extero_obs``, so its output
+        is constant across the candidate action sequences evaluated within one control
+        step. MppiController exploits this: see ``encode_context``.
+        """
+        return self.encoder(x, deterministic=deterministic)
+
+    def _predict(
+        self,
+        x: types.WorldModelSchema.Inputs,
+        encoding: types.WorldModelSchema.Encoding,
+        deterministic: bool | None = None,
+    ) -> types.WorldModelSchema.Outputs:
+        """Action-dependent half of the forward pass, on already-scaled inputs. Reads
+        only ``fut_acts`` and (when cmd_dim > 0) ``fut_cmds`` from ``x``."""
+
+        # embedding
         fut_acts_emb = self.fut_acts_embed(x["fut_acts"], deterministic=deterministic)
         if self.fut_cmds_embed is not None:
             fut_cmds_emb = self.fut_cmds_embed(
@@ -270,6 +293,34 @@ class WorldModelBase(ModelBase):
         y = self.scaler.unscale(y)
         return y
 
+    def encode_context(
+        self,
+        x: types.WorldModelSchema.Inputs,
+    ) -> types.WorldModelSchema.Encoding:
+        """``inference``'s encoder pass, exposed on its own so a planner can run it once
+        per control step instead of once per candidate action sequence.
+
+        Without this, MPPI tiles ``extero_obs`` across the sample batch and re-encodes
+        identical observations: harmless for the quadruped's MLP encoder, but for the
+        manipulation model it means running ResNet-18 over (num_trajs * num_cameras)
+        copies of the same three images, every solver iteration.
+        """
+        return self._encode(self.scaler.scale(x), deterministic=True)
+
+    def inference_from_encoding(
+        self,
+        x: types.WorldModelSchema.Inputs,
+        encoding: types.WorldModelSchema.Encoding,
+    ) -> types.WorldModelSchema.Outputs:
+        """``inference`` with the encoder output supplied by ``encode_context``.
+
+        ``x`` needs only the action-dependent fields (``fut_acts``, and ``fut_cmds``
+        when cmd_dim > 0); ``encoding`` must already be broadcast to ``x``'s batch size.
+        Equivalent to ``inference(x)`` up to floating-point associativity.
+        """
+        y = self._predict(self.scaler.scale(x), encoding, deterministic=True)
+        return self.scaler.unscale(y)
+
     def encode_latent(
         self,
         proprio_obs: jnp.ndarray,
@@ -339,7 +390,9 @@ class ManipulationWorldModel(WorldModelBase):
         fut_cmds_emb: jnp.ndarray,
         deterministic: bool | None = None,
     ) -> jnp.ndarray:
-        B = x["proprio_obs_hist"].shape[0]
+        # batch size is read off fut_acts, not proprio_obs_hist, so that _predict needs
+        # no observation fields at all -- that is what lets MPPI skip tiling them.
+        B = x["fut_acts"].shape[0]
         return jnp.broadcast_to(
             self.policy_temporal_query.value, (B, self.pred_len, self.latent_dim)
         )

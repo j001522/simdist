@@ -32,28 +32,39 @@ cmd:
 # gripper = 7 dims. Gaussian action noise std is sampled per-env in
 # [min_noise, max_noise] during data generation (Algorithm 2, Sigma_j).
 # Calibrated to the measured per-dim raw-action std (2-5) from a generated
-# dataset: min ~= 0.05*std, max ~= 1*std (Go2 used ~[0.05x, 2.5x]; we keep the
-# max conservative for contact-rich insertion). Tune as needed.
-# NEEEDS TO BE UPDATED, old dataset
+# dataset: min ~= 0.05*std (Go2 reference envelope ~[0.05x, 2.5x] std).
+# 2026-07-18: arm maxes doubled from the earlier conservative ~1x std toward the
+# Go2-relative scale (~2x). The 1x cap was our deviation from the paper, and the
+# resulting data taught the dynamics almost no action response (probe_wm_lateral:
+# lateral pushes priced ~50x under ground truth). Stronger noise = more sustained
+# deviations with visible consequences; mixture insertion rate will drop some --
+# that is coverage, not damage.
 actions:
   - name: ee_dx
     min_noise: 0.10
-    max_noise: 2.5
+    max_noise: 5.0
   - name: ee_dy
     min_noise: 0.10
-    max_noise: 2.5
+    max_noise: 5.0
   - name: ee_dz
     min_noise: 0.25
-    max_noise: 5.0
+    max_noise: 10.0
   - name: ee_drx
     min_noise: 0.20
-    max_noise: 3.5
+    max_noise: 7.0
   - name: ee_dry
     min_noise: 0.20
-    max_noise: 3.5
+    max_noise: 7.0
   - name: ee_drz
     min_noise: 0.05
-    max_noise: 1.2
+    max_noise: 2.4
+  # Nonzero gripper noise is REQUIRED for the value head: with zero noise the
+  # data contains no "open the gripper -> drop the peg" counterfactual, the WM
+  # learns open=>high value, and MPPI exploits it (the frozen_action_dims hack
+  # in mppi.py exists only to mask this). Expert |gripper| action ~2.5 and the
+  # binary action thresholds at 0, so sigma=2.5 flips ~16% of noised steps at
+  # the top of the per-env draw; transient 1-step opens don't release the peg
+  # (the expert itself emits them on ~7% of steps), only sustained opens do.
   - name: gripper
-    min_noise: 0.0
-    max_noise: 0.0
+    min_noise: 0.1
+    max_noise: 2.5

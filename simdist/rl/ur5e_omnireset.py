@@ -157,15 +157,19 @@ class Ur5eRecordEnvCfg(Ur5eRobotiq2f85DataCollectionRGBRelCartesianOSCCfg):
         # No action-noise corruption on the policy obs fed to the expert.
         self.observations.policy.enable_corruption = False
 
-        # Match the State env the expert/critic were trained on: fixed 16 s horizon,
-        # terminate only on time_out + abnormal_robot. We drop the RGB env's
-        # success/early_success terminations because (1) they cut episodes short on
-        # insertion, and process_data discards episodes shorter than
-        # H+T+beg+end (=60 steps), wasting the most valuable expert rollouts; and
-        # (2) the critic V^e is conditioned on `time_left`, calibrated to the 16 s
-        # training horizon -- a different horizon makes value targets OOD. Matches
-        # the locomotion reference too (reset on failure + time_out, no success).
-        self.episode_length_s = 16.0
+        # Terminate only on time_out + abnormal_robot (matches the State env the
+        # expert/critic were trained on and the locomotion reference). We drop the
+        # RGB env's success/early_success terminations because they cut episodes
+        # short on insertion, wasting the most valuable expert rollouts (the manip
+        # WM processes with H=5/T=5, so min episode = H+T+beg+end = 20 steps).
+        # Horizon shortened 16 s -> 10 s (80 -> 50 steps at 5 Hz): at 16 s ~62% of
+        # recorded steps were the seated V~21 plateau, collapsing the value-target
+        # distribution (Snellius scaler: 59% of normalized targets within +-0.1 of
+        # median). The critic's `time_left` obs is a fraction of the episode, so
+        # its range is unchanged; the full-distribution probe showed V is
+        # clock-insensitive (seated V holds ~+21 across the clock), re-verified
+        # with probe_critic.py at 10 s before collection.
+        self.episode_length_s = 10.0
         self.terminations.success = None
         self.terminations.early_success = None
 
