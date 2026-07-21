@@ -31,10 +31,10 @@ cmd:
 # Action space: 6-d relative end-effector pose (RelCartesianOSC) + 1 binary
 # gripper = 7 dims. Gaussian action noise std is sampled per-env in
 # [min_noise, max_noise] during data generation (Algorithm 2, Sigma_j).
-# The binary gripper dim is left uncorrupted (min=max=0).
 # Calibrated to the measured per-dim raw-action std (2-5) from a generated
 # dataset: min ~= 0.05*std, max ~= 1*std (Go2 used ~[0.05x, 2.5x]; we keep the
 # max conservative for contact-rich insertion). Tune as needed.
+# NEEEDS TO BE UPDATED, old dataset
 actions:
   - name: ee_dx
     min_noise: 0.10

@@ -176,16 +176,40 @@ class ManipulationEncoder(WorldModelEncoderBase):
             jax.random.normal(rngs["params"](), (num_types, self.latent_dim)) * 0.02
         )
 
-        # Bounds ||z||: the latent-dynamics target is the encoder's own output under
-        # stop_grad, so nothing else anchors its scale (it inflated 4 -> 46 in 600 steps
-        # and the dynamics MSE followed). Applied inside encode_latent so the target and
-        # encoding["latent"] are normalized identically.
-        # use_scale/use_bias off: a learnable gamma would let the encoder re-inflate the
-        # latent, which is the pressure we are removing. ||z|| is then pinned at
-        # sqrt(latent_dim), same property SimNorm gives TD-MPC2.
+        # Per-camera feature norm: each camera's 512-d pooled feature is normalized
+        # independently (applied before the n_cam*512 flatten in encode_latent), so one
+        # camera's raw scale can't skew the shared statistic the others get normalized
+        # against, and so the image branch isn't dominating the proprio branch purely on
+        # magnitude/dimension count going into latent_mlp.
+        # use_scale/use_bias off: a learnable gamma would let the encoder re-inflate this
+        # branch, which is the pressure we're removing.
         self.layer_norm_1 = nnx.LayerNorm(
-            self.latent_dim, use_scale=False, use_bias=False, rngs=rngs
+            self.per_image_embed_dim, use_scale=False, use_bias=False, rngs=rngs
         )
+
+        # Debug-only captures for TensorBoard (see trainer.py's "debug/" metrics). Plain
+        # nnx.Intermediate state -- same mechanism nnx.BatchNorm uses for its running
+        # stats, so it's inert to grads/optimizer.update and doesn't touch any existing
+        # return signature.
+        # encode_latent runs twice per step (current obs here in __call__, future target
+        # in WorldModelLoss via model.encode_latent) and would clobber a single slot with
+        # whichever ran last. "_input" is the one __call__ snapshots right after its own
+        # (current-obs) call, so it always reflects THIS step's input, not the target.
+        #
+        # Image feats: mean/std (not norm) of the RAW pre-LayerNorm ResNet output. Norm
+        # is the wrong metric here -- after layer_norm_1 it's mathematically pinned at
+        # sqrt(512) forever (mean=0/var=1 per feature is exactly what affine-free
+        # LayerNorm guarantees), so it can never show anything changing. Pre-LayerNorm
+        # mean/std is the part that actually moves as the backbone fine-tunes, and mean/
+        # std (unlike norm) aren't dimension-dependent, so they're the fair comparison
+        # against proprio's mean/std (models.py debug_proprio_scaled_*) despite the huge
+        # dimension mismatch (6 vs 1536).
+        self.debug_image_feat_mean = nnx.Intermediate(jnp.zeros(()))
+        self.debug_image_feat_std = nnx.Intermediate(jnp.zeros(()))
+        self.debug_latent_norm = nnx.Intermediate(jnp.zeros(()))
+        self.debug_image_feat_mean_input = nnx.Intermediate(jnp.zeros(()))
+        self.debug_image_feat_std_input = nnx.Intermediate(jnp.zeros(()))
+        self.debug_latent_norm_input = nnx.Intermediate(jnp.zeros(()))
 
     def __call__(
         self,
@@ -206,6 +230,11 @@ class ManipulationEncoder(WorldModelEncoderBase):
         latent = self.encode_latent(
             last_proprio_obs, x["extero_obs"], deterministic=deterministic
         )
+        # Snapshot debug stats now, before WorldModelLoss's separate encode_latent call
+        # (on the future target) overwrites the scratch slots above.
+        self.debug_image_feat_mean_input.value = self.debug_image_feat_mean.value
+        self.debug_image_feat_std_input.value = self.debug_image_feat_std.value
+        self.debug_latent_norm_input.value = self.debug_latent_norm.value
 
         proprio_obs_hist += self.temporal_enc[:-1]
         act_hist += self.temporal_enc[:-1]
@@ -234,12 +263,21 @@ class ManipulationEncoder(WorldModelEncoderBase):
         )  # (..., n_cam, 512)
         if self.freeze_resnet:
             feats = jax.lax.stop_gradient(feats)
+
+        # Capture BEFORE layer_norm_1: post-norm this is pinned at mean=0/std=1 by
+        # construction, so it's the raw feature that actually reflects backbone training.
+        self.debug_image_feat_mean.value = feats.mean()
+        self.debug_image_feat_std.value = feats.std()
+
+        feats = self.layer_norm_1(feats)
+
         feats = feats.reshape(
             feats.shape[:-2] + (self.n_cam * self.per_image_embed_dim,)
         )
+
         concatenated = jnp.concatenate([feats, proprio_obs], axis=-1)
         enc_latent = self.latent_mlp(concatenated, deterministic=deterministic)
-        enc_latent = self.layer_norm_1(enc_latent)
+        self.debug_latent_norm.value = jnp.linalg.norm(enc_latent, axis=-1).mean()
         return enc_latent
 
 

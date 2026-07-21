@@ -73,7 +73,7 @@ value:
     mlp_hidden_size_factor: 2
 
 # Base policy: warm-starts MPPI. For manip its decoder query is LEARNED TEMPORAL
-# EMBEDDINGS (not fut_cmds, since cmd_dim=0) -- see manipulation_port.md 3.2.
+# EMBEDDINGS (not fut_cmds, since cmd_dim=0) 
 policy:
   attention:
     layers: 4                 # [Table II] (same as quadruped)

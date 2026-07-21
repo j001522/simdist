@@ -6,6 +6,7 @@ import time
 import wandb
 import torch
 from torch.utils.data import random_split, get_worker_info, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 import flax.nnx as nnx
 import orbax.checkpoint as ocp
 import optax
@@ -37,6 +38,11 @@ def train(cfg: dict):
             config=cfg,
         )
     print("Running training with config: ", cfg)
+
+    # TensorBoard runs independently of wandb (useful when wandb.log=false, e.g. on Snellius).
+    tb_dir = os.path.join(paths.get_model_checkpoints_dir(), run_name, "tensorboard")
+    os.makedirs(tb_dir, exist_ok=True)
+    tb_writer = SummaryWriter(log_dir=tb_dir)
 
     # Create datasets
     dataset = get_dataset(cfg)
@@ -127,8 +133,12 @@ def train(cfg: dict):
 
     # Setup checkpointing with Orbax
     if cfg["checkpoint"]["enabled"]:
+        # keep_period is optional and absent from configs written before it existed
+        # (resuming reads the checkpoint's own cfg), so read it defensively.
+        keep_period = cfg["checkpoint"].get("keep_period")
         ckpt_options = ocp.CheckpointManagerOptions(
             max_to_keep=cfg["checkpoint"]["max_to_keep"],
+            keep_period=keep_period,
             create=True,
             cleanup_tmp_directories=True,
             enable_async_checkpointing=False,
@@ -226,6 +236,37 @@ def train(cfg: dict):
         metrics.update(loss=loss, **losses)
         return loss
 
+    def log_debug_stats(prefix: str):
+        # Mean/std (not norm) throughout: norm grows with sqrt(dim), which makes proprio
+        # (6-dim) and image feats (512/1536-dim) look artificially far apart even when
+        # both are properly scaled. Mean/std are per-feature and directly comparable
+        # regardless of dimension. latent_norm is the one exception -- it watches a
+        # single fixed-dimensional (latent_dim) quantity over training time (the ||z||
+        # inflation concern), so dimension-count confounds don't apply there.
+        #
+        # proprio_scaled_* comes from models.py (captured right after model.__call__'s
+        # own scaler.scale(x)) -- the SCALED values the encoder actually sees, not the
+        # raw batch.
+        metrics_dict[f"{prefix}/debug/proprio_scaled_mean"] = float(
+            model.debug_proprio_scaled_mean.value
+        )
+        metrics_dict[f"{prefix}/debug/proprio_scaled_std"] = float(
+            model.debug_proprio_scaled_std.value
+        )
+        # latent/image-feature stats only exist on ManipulationEncoder (see encoders.py
+        # debug_*_input captures); guard so this stays a no-op for the Go2 encoder.
+        if hasattr(model.encoder, "debug_latent_norm_input"):
+            metrics_dict[f"{prefix}/debug/latent_norm"] = float(
+                model.encoder.debug_latent_norm_input.value
+            )
+        if hasattr(model.encoder, "debug_image_feat_mean_input"):
+            metrics_dict[f"{prefix}/debug/image_feat_mean"] = float(
+                model.encoder.debug_image_feat_mean_input.value
+            )
+            metrics_dict[f"{prefix}/debug/image_feat_std"] = float(
+                model.encoder.debug_image_feat_std_input.value
+            )
+
     print("Starting training")
     num_epochs = cfg["training"]["num_epochs"]
     metrics_dict = {}
@@ -262,6 +303,7 @@ def train(cfg: dict):
                 for metric, value in metrics.compute().items():
                     metrics_dict[f"train/{metric}"] = float(value)
                 metrics.reset()
+                log_debug_stats("train")
 
                 # test
                 training = True
@@ -276,9 +318,13 @@ def train(cfg: dict):
                 for metric, value in metrics.compute().items():
                     metrics_dict[f"test/{metric}"] = float(value)
                 metrics.reset()
+                log_debug_stats("test")
 
                 if cfg["checkpoint"]["enabled"]:
-                    state = nnx.state(model)
+                    # Exclude debug-only Intermediate captures (encoders.py debug_*) --
+                    # pure scratch recomputed every forward pass, no reason to persist it
+                    # or risk a structure mismatch when resuming across a debug-var change.
+                    state = nnx.state(model, nnx.Not(nnx.Intermediate))
                     pure_dict_state = state.to_pure_dict()
                     with ocp.CheckpointManager(ckpt_dir, options=ckpt_options) as mngr:
                         mngr.save(
@@ -293,6 +339,10 @@ def train(cfg: dict):
                 if cfg["wandb"]["log"]:
                     wandb.log(metrics_dict, step=train_steps)
 
+                # TensorBoard logging (mirrors whatever wandb would have logged)
+                for key, value in metrics_dict.items():
+                    tb_writer.add_scalar(key, value, train_steps)
+
                 print(f"Steps: {train_steps}, Metrics: {metrics_dict}")
                 metrics_dict = {}
                 interval_start_time = time.time()
@@ -306,3 +356,5 @@ def train(cfg: dict):
 
         epoch_time = time.time() - epoch_start_time
         print(f"Epoch {epoch + 1}/{num_epochs} completed in {epoch_time:.2f} seconds.")
+
+    tb_writer.close()

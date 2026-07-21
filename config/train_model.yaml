@@ -36,6 +36,12 @@ checkpoint:
   enabled: True
   # keeps this many most recent checkpoints; leave blank to keep all
   max_to_keep: 3
+  # permanently keep every checkpoint whose step is a multiple of this, on top of the
+  # max_to_keep rolling window (orbax keep_period). Leave blank to keep only the window.
+  # Checkpoints are written every training.eval_interval steps, so set this to a multiple
+  # of eval_interval or nothing will match. Needed to probe how the model evolves: with a
+  # bare window the early/mid-training checkpoints are deleted and only the tail survives.
+  keep_period:
   # if non-empty, resume from this checkpoint
   resume_checkpoint:
 

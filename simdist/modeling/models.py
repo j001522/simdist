@@ -175,6 +175,13 @@ class WorldModelBase(ModelBase):
             rngs=rngs,
         )
 
+        # Debug-only capture (see trainer.py "debug/" metrics): mean/std of the SCALED
+        # proprio history, i.e. what the encoder actually receives, not the raw batch.
+        # mean/std (not norm) so it's directly comparable across signals of different
+        # dimensionality -- norm grows with sqrt(dim), mean/std doesn't.
+        self.debug_proprio_scaled_mean = nnx.Intermediate(jnp.zeros(()))
+        self.debug_proprio_scaled_std = nnx.Intermediate(jnp.zeros(()))
+
     def __call__(
         self,
         x: types.WorldModelSchema.Inputs,
@@ -183,6 +190,8 @@ class WorldModelBase(ModelBase):
 
         # pre-processing, encoding, and embedding
         x = self.scaler.scale(x)
+        self.debug_proprio_scaled_mean.value = x["proprio_obs_hist"].mean()
+        self.debug_proprio_scaled_std.value = x["proprio_obs_hist"].std()
         encoding = self.encoder(x, deterministic=deterministic)
         fut_acts_emb = self.fut_acts_embed(x["fut_acts"], deterministic=deterministic)
         if self.fut_cmds_embed is not None:
