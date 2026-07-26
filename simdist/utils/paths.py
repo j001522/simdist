@@ -12,6 +12,10 @@ _PATHS = {
     "SIM_DATASETS": os.path.join(SIMDIST_ROOT_PATH, "datasets", "sim"),
     "REAL_DATASETS": os.path.join(SIMDIST_ROOT_PATH, "datasets", "real"),
     "MODEL_CHECKPOINTS": os.path.join(SIMDIST_ROOT_PATH, "checkpoints", "models"),
+    # Staged pretrained weights (e.g. DINOv2 .npz). Compute nodes have no outbound
+    # network, so anything fetched from the internet is downloaded on a login node and
+    # read from here at train time.
+    "ASSETS": os.path.join(SIMDIST_ROOT_PATH, "assets"),
 }
 _FILENAMES = {
     "RAW_DATA_FILE_NAME": "raw_data.hdf5",
@@ -28,6 +32,16 @@ _FILENAMES = {
     "SCALER_PARAMS_FILE_NAME": "scaler_params.json",
     "MODEL_CONFIG_FILE_NAME": "model_config.yaml",
 }
+
+
+def get_assets_dir():
+    """Get the directory holding staged pretrained weights."""
+    return _PATHS["ASSETS"]
+
+
+def resolve_asset_path(path: str):
+    """Absolute paths pass through; relative ones resolve against the assets dir."""
+    return path if os.path.isabs(path) else os.path.join(_PATHS["ASSETS"], path)
 
 
 def get_rl_checkpoint_dir():

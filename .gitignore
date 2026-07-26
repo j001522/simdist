@@ -230,3 +230,8 @@ go2_ros2_ws/docker/simdist.requirements.txt
 *.gif
 
 lighting_check/
+
+# Staged pretrained backbone weights (scripts/stage_dinov2_weights.py) -- ~87 MB each,
+# regenerate on a login node rather than committing.
+assets/*.npz
+assets/*.safetensors
