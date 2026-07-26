@@ -26,6 +26,7 @@ IMAGENET_MEAN = jnp.array([0.485, 0.456, 0.406], dtype=jnp.float32)
 IMAGENET_STD = jnp.array([0.229, 0.224, 0.225], dtype=jnp.float32)
 
 _BN_EPS = 1e-5
+_BN_MOMENTUM = 0.9  # flax convention; == torchvision's momentum=0.1 (see _bn below)
 
 
 def imagenet_normalize(x: jnp.ndarray) -> jnp.ndarray:
@@ -49,7 +50,14 @@ def _conv1x1(cin, cout, stride, rngs):
 
 
 def _bn(features, rngs):
-    return nnx.BatchNorm(features, epsilon=_BN_EPS, use_running_average=False, rngs=rngs)
+    # momentum: flax's convention is running = momentum * running + (1 - momentum) * batch,
+    # so flax 0.9 == torchvision's default momentum=0.1 (~10-update window). Flax defaults
+    # to 0.99 (~100 updates), which tracks 10x slower than the model these weights come
+    # from -- eval-mode stats then lag a fine-tuning backbone that much further behind.
+    return nnx.BatchNorm(
+        features, epsilon=_BN_EPS, momentum=_BN_MOMENTUM, use_running_average=False,
+        rngs=rngs,
+    )
 
 
 class BasicBlock(nnx.Module):

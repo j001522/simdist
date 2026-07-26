@@ -69,6 +69,26 @@ def train(cfg: dict):
             else:
                 dataset.eval()
 
+    def set_dataset_mode(train_mode: bool) -> None:
+        """Switch augmentation on (train) / off (eval) for subsequently spawned workers.
+
+        worker_init_fn reads `training` when a DataLoader spawns its workers, which with
+        persistent_workers=False happens on every fresh iteration of that loader. So the
+        flag must be True whenever the train loader starts an epoch and False for the eval
+        pass -- hence the restore after the test loop below. Workers already running are
+        untouched (separate processes; they captured the flag at spawn), so flipping this
+        mid-epoch cannot disturb the in-flight train loader.
+
+        The direct train()/eval() call covers num_workers=0, where worker_init_fn never
+        runs at all and the loader reads this very object.
+        """
+        nonlocal training
+        training = train_mode
+        if train_mode:
+            dataset.train()
+        else:
+            dataset.eval()
+
     # create dataloaders
     train_set = DataLoader(
         train_dataset,
@@ -236,7 +256,9 @@ def train(cfg: dict):
         metrics.update(loss=loss, **losses)
         return loss
 
-    def log_debug_stats(prefix: str):
+    def debug_stats() -> dict[str, float]:
+        # Snapshot of the debug scalars left behind by the forward pass that just ran.
+        #
         # Mean/std (not norm) throughout: norm grows with sqrt(dim), which makes proprio
         # (6-dim) and image feats (512/1536-dim) look artificially far apart even when
         # both are properly scaled. Mean/std are per-feature and directly comparable
@@ -247,36 +269,50 @@ def train(cfg: dict):
         # proprio_scaled_* comes from models.py (captured right after model.__call__'s
         # own scaler.scale(x)) -- the SCALED values the encoder actually sees, not the
         # raw batch.
-        metrics_dict[f"{prefix}/debug/proprio_scaled_mean"] = float(
-            model.debug_proprio_scaled_mean.value
-        )
-        metrics_dict[f"{prefix}/debug/proprio_scaled_std"] = float(
-            model.debug_proprio_scaled_std.value
-        )
+        stats = {
+            "debug/proprio_scaled_mean": float(model.debug_proprio_scaled_mean.value),
+            "debug/proprio_scaled_std": float(model.debug_proprio_scaled_std.value),
+        }
         # latent/image-feature stats only exist on ManipulationEncoder (see encoders.py
         # debug_*_input captures); guard so this stays a no-op for the Go2 encoder.
         if hasattr(model.encoder, "debug_latent_norm_input"):
-            metrics_dict[f"{prefix}/debug/latent_norm"] = float(
+            stats["debug/latent_norm"] = float(
                 model.encoder.debug_latent_norm_input.value
             )
         if hasattr(model.encoder, "debug_image_feat_mean_input"):
-            metrics_dict[f"{prefix}/debug/image_feat_mean"] = float(
+            stats["debug/image_feat_mean"] = float(
                 model.encoder.debug_image_feat_mean_input.value
             )
-            metrics_dict[f"{prefix}/debug/image_feat_std"] = float(
+            stats["debug/image_feat_std"] = float(
                 model.encoder.debug_image_feat_std_input.value
             )
+        return stats
+
+    def log_debug_stats(prefix: str, samples: list[dict[str, float]]) -> None:
+        # These live in nnx.Intermediate scratch state, overwritten every forward pass, so
+        # reading them once reports only the LAST batch of the window. For image feats a
+        # single batch is tail-dominated and swung 2-4x between evals while the underlying
+        # trend was flat. Average over the window instead, which also matches the loss
+        # metrics (train/* = eval_interval average, test/* = full eval-pass average).
+        if not samples:
+            return
+        for key in samples[0]:
+            metrics_dict[f"{prefix}/{key}"] = sum(s[key] for s in samples) / len(samples)
 
     print("Starting training")
     num_epochs = cfg["training"]["num_epochs"]
     metrics_dict = {}
+    # Accumulated per-step debug snapshots for the current logging window. Lives outside
+    # the epoch loop because a window spans an epoch boundary whenever eval_interval does
+    # not divide len(train_set).
+    debug_samples_train = []
     interval_start_time = time.time()
     for epoch in range(num_epochs):
         print(f"Starting epoch {epoch + 1}/{num_epochs}")
         epoch_start_time = time.time()
 
         # train
-        training = True
+        set_dataset_mode(True)
         pbar_train = tqdm(train_set, desc="Training", unit="batch")
         for i, batch in enumerate(pbar_train):
             if batch is None:
@@ -286,6 +322,7 @@ def train(cfg: dict):
                 model, optimizer, metrics, batch["model_in"], batch["labels"]
             )
             pbar_train.set_description(f"Training (Loss: {float(loss):.4f})")
+            debug_samples_train.append(debug_stats())
             train_steps += 1
 
             is_last_step = i == len(train_set) - 1 and epoch == num_epochs - 1
@@ -303,22 +340,31 @@ def train(cfg: dict):
                 for metric, value in metrics.compute().items():
                     metrics_dict[f"train/{metric}"] = float(value)
                 metrics.reset()
-                log_debug_stats("train")
+                log_debug_stats("train", debug_samples_train)
+                debug_samples_train.clear()
 
-                # test
-                training = True
+                # test -- eval mode, so the test loader's workers spawn with augmentation
+                # off. (Was `training = True`, which put them in train() mode: every test
+                # loss up to now was measured on colour-jittered/blurred/cropped images
+                # with proprio noise added.)
+                set_dataset_mode(False)
                 pbar_test = tqdm(test_set, desc="Testing", unit="batch")
+                debug_samples_test = []
                 for batch in pbar_test:
                     if batch is None:
                         continue
                     batch = model_utils.dataset_batch_to_jax(batch)
                     loss = eval_step(model, metrics, batch["model_in"], batch["labels"])
+                    debug_samples_test.append(debug_stats())
                     pbar_test.set_description(f"Testing (Loss: {float(loss):.4f})")
+                # Restore before the next epoch's train loader spawns its workers,
+                # otherwise every epoch after the first trains without augmentation.
+                set_dataset_mode(True)
 
                 for metric, value in metrics.compute().items():
                     metrics_dict[f"test/{metric}"] = float(value)
                 metrics.reset()
-                log_debug_stats("test")
+                log_debug_stats("test", debug_samples_test)
 
                 if cfg["checkpoint"]["enabled"]:
                     # Exclude debug-only Intermediate captures (encoders.py debug_*) --
