@@ -95,7 +95,11 @@ def maybe_load_pretrained_encoder(model: nnx.Module, cfg: dict) -> None:
     model config asks for them (``model.encoder.extero_obs.resnet.pretrained ==
     "imagenet"``). No-op for models without a ResNet encoder (e.g. Go2). Kept out of
     ``__init__`` so model construction stays torch-free; only called for a freshly
-    created model, never when resuming (the checkpoint already holds the weights)."""
+    created model, never when resuming (the checkpoint already holds the weights).
+
+    The DINOv2 encoder does NOT go through here: it is frozen, so its weights are read
+    from the staged .npz inside ``DINOv2Backbone.__init__`` and there is no random-init
+    state to overwrite. This function early-returns for it (no ``resnet`` config key)."""
     enc_cfg = cfg["model"].get("encoder", {}) or {}
     resnet_cfg = (enc_cfg.get("extero_obs", {}) or {}).get("resnet", {}) or {}
     if resnet_cfg.get("pretrained") != "imagenet":

@@ -20,6 +20,8 @@ simdist/                         # Python package (installed editable: pip insta
        trainer.py                # train(cfg) — Hydra entrypoint logic
        models.py                 # world model architectures
        encoders.py               # observation encoders
+       resnet.py                 # ResNet-18 backbone (nnx port of torchvision weights)
+       dinov2.py                 # frozen DINOv2 backbone (wraps FlaxDinov2Model)
        modules.py losses.py types.py scaler.py
    data/
        data_recorder.py          # buffers rollouts to HDF5
@@ -157,6 +159,52 @@ python scripts/simulate_go2.py model.checkpoint=<checkpoint>
 ```
 
 `generate_data.yaml` mixes the expert (iter 4999) at 50% with non-expert iterations 0..2000 and applies bursty action corruption — important for world-model coverage.
+
+## Frozen DINOv2 encoder (branch `dinov2-frozen-encoder`)
+
+Alternative image backbone for `ManipulationEncoder`, selected by config: put a `dinov2`
+block under `model.encoder.extero_obs` instead of `resnet`
+(`config/model/manipulation_world_model_dino.yaml`). Follows **Newt** (Hansen et al.,
+2025): a *pooled* frozen DINOv2 embedding concatenated with proprioception into the MLP
+state encoder. DINO-WM keeps the full patch-token grid instead, but it has no
+reward/value head to carry the task signal; simdist has one, so pooling is consistent.
+
+ViT-S/14 @224 → `cls_mean` pooling (CLS ‖ mean-of-patches) = 768/camera → 3×768 + 6
+proprio = 2310 into `latent_mlp`. Trainable params drop 12.0M → 0.93M (the ResNet was
+11M of the old total); 21.6M frozen backbone params sit in `FrozenParam`, which is *not*
+`nnx.Param`, so `trainer.py`'s `wrt=nnx.Param` optimizer and `DiffState(0, nnx.Param)`
+grads skip them with no trainer change. Verified: 0 grad entries under `encoder.dinov2`.
+
+Three non-obvious things:
+
+1. **`transformers==4.48.*` is required.** Flax support was removed in v5 —
+   `modeling_flax_dinov2.py` is 404 on `main`, present on tag `v4.48.3`. Installed with
+   `--no-deps` (+ `huggingface-hub==0.27.1`, which must stay <1.0), verified not to move
+   jax/flax/numpy/torch.
+2. **`FlaxDinov2Model` is broken for batch > 1** whenever input resolution ≠ the
+   checkpoint's 518px: `interpolate_pos_encoding` reshapes the position embedding with
+   `hidden_states.shape[0]` (the input batch size) instead of 1. Workaround:
+   `scripts/stage_dinov2_weights.py` bakes the interpolated embedding into the params
+   using *torch's* implementation and sets `config.image_size=224`, so that branch
+   early-returns and all 12 blocks run as stock transformers code. Matches the torch
+   reference to rel 1.4e-6. **Do not "simplify" the baked embedding away.**
+3. **`feature_norm: blockwise`, not `layernorm`.** Measured on 384 real frames, CLS std
+   ≈2.32 vs mean-patch std ≈1.44 (ratio ~1.6, since averaging 256 tokens shrinks the
+   vector). One LayerNorm over the concatenation keeps that ratio at 1.53; normalizing
+   each block separately gives 1.00. Per-image scale varies only ~1.5% of the
+   within-vector std, so affine-free LayerNorm discards nothing worth keeping and no
+   dataset-statistics artifact is needed.
+
+Staging (login node — compute nodes have no outbound network):
+
+```bash
+python scripts/stage_dinov2_weights.py            # -> assets/dinov2-small-224.npz (86.6 MB)
+```
+
+The script self-verifies against the torch reference and exits non-zero on divergence.
+`assets/*.npz` is gitignored; regenerate rather than commit. Being frozen and
+LayerNorm-only, this backbone also makes train and eval bit-identical (`max|train-eval|
+= 0`), which removes the BatchNorm train/eval gap the ResNet had.
 
 ## Adapting to AIC (UR5e cable insertion)
 

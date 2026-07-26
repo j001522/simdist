@@ -3,7 +3,8 @@ import jax.numpy as jnp
 import jax
 
 from simdist.modeling import types, modules, resnet
-from simdist.utils import config, extero
+from simdist.modeling import dinov2 as dinov2_mod
+from simdist.utils import config, extero, paths
 
 
 class WorldModelEncoderBase(nnx.Module):
@@ -141,12 +142,40 @@ class ManipulationEncoder(WorldModelEncoderBase):
         H = self.model_cfg["dataset"]["history_length"]
         self.hist_enc_len = 2 * H
 
-        resnet_cfg = self.enc_cfg["extero_obs"]["resnet"]
+        extero_cfg = self.enc_cfg["extero_obs"]
         self.n_cam = len(config.extero_obs_names_from_sys_config(self.sys_cfg))
-        self.per_image_embed_dim = resnet_cfg["per_image_embed_dim"]
-        self.freeze_resnet = resnet_cfg.get("freeze", False)
-        self.resnet = resnet.ResNet18Backbone(rngs=rngs)
-        assert self.resnet.out_features == self.per_image_embed_dim
+
+        # Backbone: frozen DINOv2 (encoder.extero_obs.dinov2) or the fine-tuned
+        # ResNet-18 (encoder.extero_obs.resnet). Held as two separate attributes rather
+        # than one renamed `backbone` so that ResNet runs trained before this branch keep
+        # their orbax state layout and still resume.
+        self.use_dinov2 = "dinov2" in extero_cfg
+        if self.use_dinov2:
+            dino_cfg = extero_cfg["dinov2"]
+            shapes = config.extero_obs_image_shapes_from_sys_config(self.sys_cfg)
+            sizes = {(s[0], s[1]) for s in shapes}
+            if len(sizes) != 1:
+                raise ValueError(
+                    f"DINOv2 encoder needs one image size for all cameras, got {sizes}"
+                )
+            h, w = sizes.pop()
+            if h != w:
+                raise ValueError(f"DINOv2 encoder expects square images, got {h}x{w}")
+            npz = paths.resolve_asset_path(dino_cfg["weights"])
+            self.dinov2 = dinov2_mod.get_dinov2_backbone(dino_cfg, h, npz)
+            self.resnet = None
+            # Always frozen: the point of this branch. Weights are FrozenParam, so the
+            # optimizer never sees them (see dinov2.py) -- this flag only drives the
+            # explicit stop_gradient in encode_latent.
+            self.freeze_resnet = True
+            self.per_image_embed_dim = self.dinov2.out_features
+        else:
+            resnet_cfg = extero_cfg["resnet"]
+            self.per_image_embed_dim = resnet_cfg["per_image_embed_dim"]
+            self.freeze_resnet = resnet_cfg.get("freeze", False)
+            self.resnet = resnet.ResNet18Backbone(rngs=rngs)
+            self.dinov2 = None
+            assert self.resnet.out_features == self.per_image_embed_dim
 
         self.proprio_obs_proj = modules.MLP(
             input_dim=self.proprio_obs_dim,
@@ -176,15 +205,50 @@ class ManipulationEncoder(WorldModelEncoderBase):
             jax.random.normal(rngs["params"](), (num_types, self.latent_dim)) * 0.02
         )
 
-        # Per-camera feature norm: each camera's 512-d pooled feature is normalized
-        # independently (applied before the n_cam*512 flatten in encode_latent), so one
+        # Per-camera feature norm: each camera's pooled feature is normalized
+        # independently (applied before the n_cam*embed flatten in encode_latent), so one
         # camera's raw scale can't skew the shared statistic the others get normalized
         # against, and so the image branch isn't dominating the proprio branch purely on
         # magnitude/dimension count going into latent_mlp.
         # use_scale/use_bias off: a learnable gamma would let the encoder re-inflate this
-        # branch, which is the pressure we're removing.
+        # branch, which is the pressure we're removing. Affine-free LayerNorm therefore
+        # has no parameters at all, which is why "blockwise" below can afford a second one.
+        #
+        # feature_norm modes:
+        #   "layernorm" -- one LayerNorm over the whole per-image vector (ResNet default,
+        #                  unchanged behaviour).
+        #   "blockwise" -- DINOv2 "cls_mean" pooling concatenates two blocks with
+        #                  different natural scales (the CLS token vs the mean of 256
+        #                  patch tokens, which is an average and so shrinks toward its
+        #                  own mean). A single LayerNorm over the concatenation rescales
+        #                  both by one shared statistic and preserves that imbalance;
+        #                  normalizing each block separately removes it.
+        #   "none"      -- feed raw backbone output; the first Linear of latent_mlp has
+        #                  to absorb the scale.
+        self.feature_norm = extero_cfg.get(
+            "feature_norm", "blockwise" if self.use_dinov2 else "layernorm"
+        )
+        if self.feature_norm not in ("layernorm", "blockwise", "none"):
+            raise ValueError(f"unknown feature_norm {self.feature_norm!r}")
+        self.norm_block_dim = None
+        if self.feature_norm == "blockwise":
+            if not self.use_dinov2:
+                raise ValueError("feature_norm='blockwise' is only defined for DINOv2")
+            # cls_mean splits into two equal halves; cls/mean pooling is a single block,
+            # in which case blockwise degenerates to plain layernorm.
+            self.norm_block_dim = (
+                self.dinov2.hidden_size
+                if self.dinov2.pooling == "cls_mean"
+                else self.per_image_embed_dim
+            )
         self.layer_norm_1 = nnx.LayerNorm(
-            self.per_image_embed_dim, use_scale=False, use_bias=False, rngs=rngs
+            self.norm_block_dim or self.per_image_embed_dim,
+            use_scale=False,
+            use_bias=False,
+            rngs=rngs,
+        )
+        self.layer_norm_2 = nnx.LayerNorm(
+            self.latent_dim, use_scale=False, use_bias=False, rngs=rngs
         )
 
         # Debug-only captures for TensorBoard (see trainer.py's "debug/" metrics). Plain
@@ -258,18 +322,26 @@ class ManipulationEncoder(WorldModelEncoderBase):
     ) -> jnp.ndarray:
         # extero_obs: (..., n_cam, H, W, 3) camera images. ResNet flattens leading dims;
         # shape-agnostic so this also serves target encoding E(o_{t+1:t+T}) in the loss.
-        feats = self.resnet(
+        backbone = self.dinov2 if self.use_dinov2 else self.resnet
+        feats = backbone(
             extero_obs, train=not bool(deterministic), normalize=True
-        )  # (..., n_cam, 512)
+        )  # (..., n_cam, per_image_embed_dim)
         if self.freeze_resnet:
             feats = jax.lax.stop_gradient(feats)
 
         # Capture BEFORE layer_norm_1: post-norm this is pinned at mean=0/std=1 by
         # construction, so it's the raw feature that actually reflects backbone training.
+        # With a frozen backbone these are constants of the dataset rather than a training
+        # signal -- still worth logging, since a drift means the INPUT distribution moved.
         self.debug_image_feat_mean.value = feats.mean()
         self.debug_image_feat_std.value = feats.std()
 
-        feats = self.layer_norm_1(feats)
+        if self.feature_norm == "blockwise":
+            # Normalize each pooling block independently, then re-concatenate.
+            blocks = jnp.split(feats, feats.shape[-1] // self.norm_block_dim, axis=-1)
+            feats = jnp.concatenate([self.layer_norm_1(b) for b in blocks], axis=-1)
+        elif self.feature_norm == "layernorm":
+            feats = self.layer_norm_1(feats)
 
         feats = feats.reshape(
             feats.shape[:-2] + (self.n_cam * self.per_image_embed_dim,)
@@ -278,6 +350,7 @@ class ManipulationEncoder(WorldModelEncoderBase):
         concatenated = jnp.concatenate([feats, proprio_obs], axis=-1)
         enc_latent = self.latent_mlp(concatenated, deterministic=deterministic)
         self.debug_latent_norm.value = jnp.linalg.norm(enc_latent, axis=-1).mean()
+        enc_latent = self.layer_norm_2(enc_latent)
         return enc_latent
 
 
