@@ -1,6 +1,8 @@
+# Manipulation (UR5e cable/peg insertion) world model. The Go2 stack is still in the
+# repo (system/go2.yaml, model/quadruped_world_model.yaml) but is no longer the default.
 defaults:
-  - system: go2
-  - model: quadruped_world_model
+  - system: ur5e
+  - model: manipulation_world_model
   - loss: world_model
   - heads: all
   - _self_
@@ -8,40 +10,56 @@ defaults:
 run_name:
 
 data:
-  dataset_name:
-  num_train_workers: 8
+  # 2026-07-16_14-49-21 = re-collection with a fixed critic (the earlier
+  # 2026-07-11_13-31-39 had value targets from an OOD critic: scattered about 0, with
+  # negatives). Rewards are unchanged between the two.
+  # The processed subdir is picked by the MODEL's H/T, i.e.
+  # datasets/sim/<name>/processed_data_ur5e_H-5_T-5 -- see paths.get_processed_data_dir.
+  dataset_name: 2026-07-16_14-49-21
+  num_train_workers: 12
   num_test_workers: 4
   prefetch_factor: 2
 
 training:
-  num_epochs: 2
+  num_epochs: 5
   max_steps:  # will train until num_epochs, or max_steps (if given), whichever is first
   eval_interval: 1000  # evaluates and checkpoints at this interval
   learning_rate: 0.0002
-  warmup_steps: 10000    # absolute; sized for the full dataset
-  decay_steps: 400000    # absolute; sized for the full dataset
+  # warmup_steps/decay_steps are ABSOLUTE and were sized for the massive Go2 dataset;
+  # on the manip dataset they exceed the whole run. The *_ratio knobs below take
+  # precedence and scale the schedule to the actual step count, so these are inert.
+  warmup_steps: 10000
+  decay_steps: 400000
   # For smaller datasets set these fractions instead — the schedule is then derived
   # from the actual total steps (num_epochs * steps_per_epoch, or max_steps). Leave
   # null to use the absolute warmup_steps/decay_steps above.
-  warmup_ratio:          # e.g. 0.05
-  decay_ratio:           # e.g. 1.0 (cosine-decay over the whole run)
-  end_learning_rate: 0.0001
-  grad_clip_norm:        # e.g. 1.0 to clip grads by global norm; null = off
-  batch_size: 512
-  training_data_ratio: 0.998  # portion of dataset to use for training; the rest is used for evaluation
+  warmup_ratio: 0.05
+  decay_ratio: 1.0       # cosine-decay over the whole run
+  # 1e-4 (half the 2e-4 peak) made the cosine floor at half peak and never anneal: run
+  # 24612774 bounced in test/loss 0.15-0.29 over its last 10k steps. 1e-5 so the final
+  # step is the best one.
+  end_learning_rate: 1e-5
+  grad_clip_norm: 1.0    # clip by global norm; avoids latent-scale spikes. null = off
+  batch_size: 256
+  # 0.998 was sized for the Go2 dataset; here it leaves only ~1.9k test trajectories
+  # (7 eval batches) and the test curve is noise. 0.99 -> ~9.5k.
+  training_data_ratio: 0.99  # portion of dataset to use for training; the rest is used for evaluation
   seed: 42
 
 checkpoint:
   # create a checkpoint in this directory with the given run name, if resume_checkpoint is not set
   enabled: True
   # keeps this many most recent checkpoints; leave blank to keep all
-  max_to_keep: 3
+  # max_to_keep=5 nearly lost the last healthy checkpoint in run 24591803 (it diverged
+  # inside the final 5 eval intervals). Keep more.
+  max_to_keep: 10
   # permanently keep every checkpoint whose step is a multiple of this, on top of the
   # max_to_keep rolling window (orbax keep_period). Leave blank to keep only the window.
   # Checkpoints are written every training.eval_interval steps, so set this to a multiple
   # of eval_interval or nothing will match. Needed to probe how the model evolves: with a
   # bare window the early/mid-training checkpoints are deleted and only the tail survives.
-  keep_period:
+  # (Runs 24708772 and 24729830 kept steps 64000-73840 and nothing earlier.)
+  keep_period: 2000
   # if non-empty, resume from this checkpoint
   resume_checkpoint:
 

@@ -6,7 +6,7 @@ history_length: 25
 prediction_length: 25
 
 # Don't include this many steps at the beginning of an episode in the dataset
-beg_padding: 5
+beg_padding: 0
 
 # Don't include this many steps at the end of an episode in the dataset
-end_padding: 5
+end_padding: 0
