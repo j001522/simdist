@@ -6,8 +6,11 @@ type: manipulation_world_model
 
 dataset:
   type: manipulation_world_model
-  history_length: 10      # [TBD] world-model history H (paper "minimal history"); tune
-  prediction_length: 10   # [TBD] planning/prediction horizon T; tune to control rate
+  # H/T also select the processed dataset directory (processed_data_ur5e_H-<H>_T-<T>):
+  # paths.get_processed_data_dir builds that name from THIS config, not from
+  # config/process_data.yaml. Changing them requires the matching subdir to exist.
+  history_length: 5       # 5 Hz data -> 1.0 s of history
+  prediction_length: 5    # 5 Hz data -> 1.0 s horizon
   augmentations:
     add_noise: true       # proprio gaussian noise [app:manip]
     image:                # visual augs [app:manip] -- consumed by ManipulationWorldModelDataset (3.3)
