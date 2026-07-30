@@ -62,15 +62,4 @@ base_policy_only: false
 # See diag_value_vs_height.py and [[wm-sole-bottleneck]].
 value_weight: 1.0
 
-# NOTE: these three stds are scalars applied to all 7 action dims, and MPPI plans
-# in RAW action units (the model scales fut_acts internally and unscales the policy
-# head output). Two known problems, deliberately left alone for now so the effect of
-# this config change stays isolated:
-#   1. dim 6 (gripper) is binary and was generated with min_noise = max_noise = 0,
-#      so the world model has never seen a perturbed gripper action; MPPI will
-#      still sample N(0, init_std) into it.
-#   2. our measured per-dim raw action std is 2-5 and unequal across dims, so a
-#      single scalar sits outside the data-generation noise envelope for some dims
-#      (drz) and under-explores others (dz).
-# Fix is per-dim std vectors calibrated against the actions envelope in
-# config/system/ur5e.yaml. See the mppi-manip branch discussion.
+
