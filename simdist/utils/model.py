@@ -56,10 +56,42 @@ def load_model_from_ckpt(
             _copy_matching_leaves(model_pure_dict, raw)
             restored_pure_dict = model_pure_dict
 
+    # FrozenParam (the DINOv2 backbone) holds an entire param TREE as the value of
+    # ONE variable. `to_pure_dict` expands that into nested dicts, but
+    # `replace_by_pure_dict` walks the State, where it is a single leaf -- so the
+    # expanded paths are rejected ("key in pure_dict not available in state") under
+    # flax 0.12.7. Detach the subtree here and assign it straight onto the variable
+    # after the merge, which is what the expanded form meant in the first place.
+    frozen_trees = _detach_frozen_trees(model, restored_pure_dict)
+
     model_state.replace_by_pure_dict(restored_pure_dict)
     model = nnx.merge(graphdef, model_state)
 
+    for get_var, subtree in frozen_trees:
+        get_var(model).value = jax.tree.map(jnp.asarray, subtree)
+
     return model, model_cfg, step
+
+
+def _detach_frozen_trees(model, pure: dict):
+    """Pop tree-valued Variable subtrees out of ``pure`` before a strict replace.
+
+    Returns [(accessor, subtree)] where ``accessor(model)`` yields the Variable to
+    assign after ``nnx.merge``. Only the DINOv2 backbone uses this shape today;
+    ResNet checkpoints have no tree-valued variables and are untouched.
+    """
+    out = []
+    encoder = getattr(model, "encoder", None)
+    backbone = getattr(encoder, "dinov2", None) if encoder is not None else None
+    if backbone is None or not isinstance(getattr(backbone, "params", None), nnx.Variable):
+        return out
+    node = pure.get("encoder", {}).get("dinov2")
+    if not isinstance(node, dict) or not isinstance(node.get("params"), dict):
+        return out
+    out.append((lambda m: m.encoder.dinov2.params, node.pop("params")))
+    if not node:
+        pure["encoder"].pop("dinov2")
+    return out
 
 
 def _copy_matching_leaves(dst: dict, src: dict) -> None:

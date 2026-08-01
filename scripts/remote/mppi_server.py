@@ -19,6 +19,7 @@ import socket
 import sys
 import traceback
 import types as _t
+import importlib.machinery as _machinery
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
@@ -32,7 +33,12 @@ def _install_stubs() -> None:
     """`simdist.data.dataset` pulls torch + h5py for a type only (DatasetBatch),
     never used on the inference path. Stub them so the JAX side stays lean."""
     for n in ("torch", "torch.utils", "torch.utils.data"):
-        sys.modules.setdefault(n, _t.ModuleType(n))
+        mod = sys.modules.setdefault(n, _t.ModuleType(n))
+        # transformers (needed by the DINOv2 backbone) probes for torch with
+        # importlib.util.find_spec, which raises ValueError on a module whose
+        # __spec__ is None. Give the stub a spec so the probe returns cleanly and
+        # transformers concludes torch is simply unavailable.
+        mod.__spec__ = _machinery.ModuleSpec(n, None)
     d = sys.modules["torch.utils.data"]
     d.Dataset = type("Dataset", (), {})
     d.DataLoader = object
@@ -72,6 +78,13 @@ def build_controller(simdist_dir: str, ckpt_dir: str, ctrl_cfg: dict,
         model = models.get_model(model_cfg, mu.make_dummy_scaler_params(model_cfg),
                                  nnx.Rngs(0))
         print("[mppi_server] fresh-init weights (no restore)", flush=True)
+    # The debug Intermediates are written under trainer.py's nnx.jit, where the module
+    # is an nnx argument. MPPI's jit closes over the model instead, so the same writes
+    # raise TraceContextError. Nothing reads them at inference.
+    model.collect_debug_stats = False
+    if getattr(model, "encoder", None) is not None:
+        model.encoder.collect_debug_stats = False
+
     controller = MppiController(model, model_cfg, ctrl_cfg)
     return controller
 

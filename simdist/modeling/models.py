@@ -181,6 +181,7 @@ class WorldModelBase(ModelBase):
         # dimensionality -- norm grows with sqrt(dim), mean/std doesn't.
         self.debug_proprio_scaled_mean = nnx.Intermediate(jnp.zeros(()))
         self.debug_proprio_scaled_std = nnx.Intermediate(jnp.zeros(()))
+        self.collect_debug_stats = True  # off at inference; see encoders.py
 
     def __call__(
         self,
@@ -188,8 +189,9 @@ class WorldModelBase(ModelBase):
         deterministic: bool | None = None,
     ) -> types.WorldModelSchema.Outputs:
         x = self.scaler.scale(x)
-        self.debug_proprio_scaled_mean.value = x["proprio_obs_hist"].mean()
-        self.debug_proprio_scaled_std.value = x["proprio_obs_hist"].std()
+        if self.collect_debug_stats:
+            self.debug_proprio_scaled_mean.value = x["proprio_obs_hist"].mean()
+            self.debug_proprio_scaled_std.value = x["proprio_obs_hist"].std()
         encoding = self._encode(x, deterministic=deterministic)
         return self._predict(x, encoding, deterministic=deterministic)
 
