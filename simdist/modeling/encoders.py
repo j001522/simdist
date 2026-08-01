@@ -186,6 +186,16 @@ class ManipulationEncoder(WorldModelEncoderBase):
         self.layer_norm_1 = nnx.LayerNorm(
             self.per_image_embed_dim, use_scale=False, use_bias=False, rngs=rngs
         )
+        # Bounds ||z||: the latent-dynamics target is the encoder's own output under
+        # stop_grad, so nothing else anchors its scale (it inflated 4 -> 46 in 600 steps
+        # and the dynamics MSE followed). 027004f MOVED the original post-MLP norm to the
+        # per-camera position above instead of adding one, which dropped this anchor;
+        # d1ea300 restored it as layer_norm_2 but only on the DINOv2 branch, where model
+        # development happens. Affine-free like layer_norm_1, so it has no parameters and
+        # existing checkpoints still restore unchanged.
+        self.layer_norm_2 = nnx.LayerNorm(
+            self.latent_dim, use_scale=False, use_bias=False, rngs=rngs
+        )
 
         # Debug-only captures for TensorBoard (see trainer.py's "debug/" metrics). Plain
         # nnx.Intermediate state -- same mechanism nnx.BatchNorm uses for its running
@@ -287,6 +297,7 @@ class ManipulationEncoder(WorldModelEncoderBase):
         enc_latent = self.latent_mlp(concatenated, deterministic=deterministic)
         if self.collect_debug_stats:
             self.debug_latent_norm.value = jnp.linalg.norm(enc_latent, axis=-1).mean()
+        enc_latent = self.layer_norm_2(enc_latent)
         return enc_latent
 
 
