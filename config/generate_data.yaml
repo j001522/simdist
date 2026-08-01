@@ -6,7 +6,18 @@ defaults:
 # 5 Hz expert (decimation 24); record env matches via Ur5eRecordEnvCfg.decimation=24.
 rl_run: omnireset_2026-07-01_16-31-09
 envs: 256       # parallel envs; rendering 3 cameras is heavy, keep modest
-steps: 10000   # total env steps; trajectories accumulate as episodes reset (default 25000)
+# `steps` is LOOP ITERATIONS, not env steps: each iteration is one env.step()
+# across all `envs`, so recorded env steps = envs * steps.
+# Sized for the paper's 100k trajectories (app:manip), read as 100k EPISODES:
+# replaying the stop_on_success rule over the 07-18 rollouts (expert_prob 0.5,
+# same noise) gives a mean truncated episode of 32.1 steps, so
+#   100k eps * 32.1 / 256 envs = 12540 iterations = 3.21M env steps (~82 GB raw).
+# At H=T=5 with 0/0 padding that is ~2.21M training windows (22.07 win/ep).
+# Caveat: 32.1 was measured on the OLD GraspedVert* banks. If the expert seats
+# less often on the full bank below, episodes lengthen toward the 50-step horizon
+# and the same 12540 iterations yield proportionally FEWER (down to ~64k)
+# episodes. Episode count is an outcome here, not a setting.
+steps: 12540
 seed: 42
 
 # Simplified single-nominal task (ur5e only): every DR event PINNED to a
@@ -28,11 +39,34 @@ seed: 42
 # rarer low cell. VertLow gates (2026-07-18): expert 0.980/512 eps (failures =
 # the known 3.8cm stall, no timeouts), critic monotone +18->+21 from 30cm
 # lateral starts. Arm noise maxes doubled in system/ur5e.yaml same day.
+#
+# Collection #4 (2026-07-24): GraspedVertHigh+VertLow -> GraspedAboveTable, the
+# FULL grasped distribution (8379 states vs 1994). The 2x2 grid used only 21% of
+# the held states and left two holes that the WM then had to extrapolate across:
+# no peg tilt in 30-60 deg (where the median tilt of 40.5 deg and ~70% of the
+# mass live) and no height in 0.05-0.12 m (the descent-to-contact band). Both are
+# prime suspects for the lateral under-pricing above. Bank filter is recorded in
+# resets/Resets/Peg__PegHole/resets_GraspedAboveTable.json.
+# NOT YET GATED: unlike every previous bank change, the expert's success rate on
+# this distribution is unmeasured -- the 30-60 deg tilt band is behaviour it has
+# never been evaluated on. Gate first with
+#   isaacpy experiments/ood_insertion/eval_scenarios.py \
+#     --scenario GraspedAboveTable --iteration 1600 --num_envs 512
+# Revert = reset_types [GraspedVertHigh, GraspedVertLow], probs [0.6, 0.4].
 simplify:
   enabled: true
   reset_dir: /shared/giacomo/experiments/ood_insertion/resets
-  reset_types: [GraspedVertHigh, GraspedVertLow]
-  probs: [0.6, 0.4]
+  reset_types: [GraspedAboveTable]
+  probs: [1.0]
+
+# Early-terminate an episode once the peg is seated (>=5 consecutive seated
+# steps, gated to >= min_episode_length so every kept episode still spans the WM
+# window H+T+pad). Stops recording the long redundant seated V~21 plateau and
+# frees sim time for more distinct rollouts; also populates the per-demo
+# `success` attr. Set enabled: false for the old time_out-only behavior.
+stop_on_success:
+  enabled: true
+  min_episode_length: 20
 
 expert: 1600  # 5Hz run's evaluated checkpoint (success 0.8877; eval_model_1600.json)
 expert_prob: 0.5  # reset with a sub-optimal checkpoint with prob 0.5 (paper)
