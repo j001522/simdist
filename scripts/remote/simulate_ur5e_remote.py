@@ -251,6 +251,22 @@ class Ur5eSim:
         env_cfg.scene.num_envs = 1
         env_cfg.seed = self.cfg["sim"]["seed"]
 
+        # Eval-only horizon override; leaves the collection env's default alone.
+        ep_len = self.cfg["sim"].get("episode_length_s")
+        if ep_len is not None:
+            env_cfg.episode_length_s = float(ep_len)
+        # Control rate is 1 / (decimation * sim.dt) = 5 Hz at decimation 24. Report the
+        # resulting budget: episodes end on the env's time_out, not on sim.max_steps,
+        # so this is the number that actually governs how long the planner gets.
+        hz = 1.0 / (env_cfg.decimation * env_cfg.sim.dt)
+        n_steps = round(env_cfg.episode_length_s * hz)
+        print(f"[env] episode_length_s={env_cfg.episode_length_s} @ {hz:.1f} Hz "
+              f"-> {n_steps} steps/episode (sim.max_steps={self.max_steps})", flush=True)
+        if n_steps > self.max_steps:
+            print(f"[env] WARNING: max_steps={self.max_steps} clips the episode at "
+                  f"{self.max_steps} of {n_steps} steps; raise sim.max_steps",
+                  flush=True)
+
         if self.cfg["sim"]["simplified"]:
             reset_types = tuple(self.cfg["sim"]["reset_types"])
             simplify_events(

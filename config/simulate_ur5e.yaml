@@ -12,6 +12,16 @@ sim:
                        # out first at episode_length_s=10 s / 5 Hz (decimation 24 @
                        # sim.dt=1/120) = 50 steps.
   seed: 42
+  # Evaluation-only horizon override, in seconds. null keeps Ur5eRecordEnvCfg's own
+  # 10 s (= 50 steps at 5 Hz), which is what the dataset was collected at, so the
+  # collection env is left untouched.
+  #
+  # Raising it gives the planner more time, but note the horizon was deliberately cut
+  # 16 s -> 10 s during collection: past ~10 s most recorded steps were the seated
+  # V~21 plateau. Steps beyond the training horizon are off-distribution for the value
+  # head, so treat long-horizon successes as weaker evidence than in-horizon ones.
+  # Keep max_steps above episode_length_s * 5 or it will clip the episode instead.
+  episode_length_s: null
   # Ur5eRecordEnvCfg's simplified variant: DR off, single grasped reset bank. Must
   # match how the dataset the world model was trained on was collected -- planning
   # against a model trained on the simplified task in the full-DR env is off-
