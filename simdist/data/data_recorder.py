@@ -73,6 +73,20 @@ class DataRecorder:
         env_cfg.recorders.dataset_filename = paths.get_raw_data_filename()
         env_cfg.scene.num_envs = self.N
 
+        # Optional: early-terminate episodes on insertion success (ur5e only). The
+        # record cfg defaults to stop_on_success=True (min length 20); a
+        # stop_on_success block in generate_data.yaml overrides it per run.
+        if cfg["system"]["name"] in ("ur5e", "ur5e_omnireset"):
+            sos = cfg.get("stop_on_success")
+            if sos is not None:
+                if not sos.get("enabled", True):
+                    env_cfg.terminations.success = None
+                elif sos.get("min_episode_length") is not None:
+                    env_cfg.terminations.success.params["min_episode_length"] = int(sos["min_episode_length"])
+            enabled = env_cfg.terminations.success is not None
+            ml = env_cfg.terminations.success.params["min_episode_length"] if enabled else None
+            print(f"[stop_on_success] {enabled}" + (f" (min_episode_length {ml})" if enabled else ""))
+
         # Optional: collapse the manipulation env to the simplified single-nominal
         # task (all DR off, one grasped reset bank). Single source of truth shared
         # with the eval/MPPI side -> data is recorded and tested in the same

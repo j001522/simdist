@@ -136,6 +136,14 @@ class ManipRecorderManagerCfg(RecorderManagerBaseCfg):
 class Ur5eRecordEnvCfg(Ur5eRobotiq2f85DataCollectionRGBRelCartesianOSCCfg):
     """RGB data-collection env + state policy/critic obs groups + recorders."""
 
+    # Early-terminate a collection episode once the peg is seated (5-step dwell,
+    # via the base RGB `success` DoneTerm). Gated to >= success_min_episode_length
+    # so every kept episode is still long enough for the WM window (H+T+beg+end;
+    # H=T=5 -> 20). Set stop_on_success=False for the old time_out-only behavior.
+    # DataRecorder overrides these from the generate_data `stop_on_success` block.
+    stop_on_success: bool = True
+    success_min_episode_length: int = 20
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -157,11 +165,6 @@ class Ur5eRecordEnvCfg(Ur5eRobotiq2f85DataCollectionRGBRelCartesianOSCCfg):
         # No action-noise corruption on the policy obs fed to the expert.
         self.observations.policy.enable_corruption = False
 
-        # Terminate only on time_out + abnormal_robot (matches the State env the
-        # expert/critic were trained on and the locomotion reference). We drop the
-        # RGB env's success/early_success terminations because they cut episodes
-        # short on insertion, wasting the most valuable expert rollouts (the manip
-        # WM processes with H=5/T=5, so min episode = H+T+beg+end = 20 steps).
         # Horizon shortened 16 s -> 10 s (80 -> 50 steps at 5 Hz): at 16 s ~62% of
         # recorded steps were the seated V~21 plateau, collapsing the value-target
         # distribution (Snellius scaler: 59% of normalized targets within +-0.1 of
@@ -170,8 +173,24 @@ class Ur5eRecordEnvCfg(Ur5eRobotiq2f85DataCollectionRGBRelCartesianOSCCfg):
         # clock-insensitive (seated V holds ~+21 across the clock), re-verified
         # with probe_critic.py at 10 s before collection.
         self.episode_length_s = 10.0
-        self.terminations.success = None
+
+        # Terminations. Always keep time_out + abnormal_robot. `early_success`
+        # (which ends fast-seaters as FAILURES before min_episode_length) stays
+        # OFF -- for collection we want those episodes kept, not discarded. The
+        # `success` DoneTerm (>=5 consecutive seated steps) ends seated episodes
+        # early: this stops recording the long redundant seated V~21 plateau
+        # (further easing the value-target collapse above) and frees sim time for
+        # more distinct rollouts. It is gated to success_min_episode_length so
+        # every kept episode still spans the WM window. Enabling it also makes the
+        # recorded per-demo `success` attr meaningful (RecorderManager reads the
+        # active `success` termination). Note the expert critic was trained WITHOUT
+        # success termination, so its recorded V at a seated step still reads ~21
+        # (a valid distillation target); we simply record fewer such steps.
         self.terminations.early_success = None
+        if self.stop_on_success:
+            self.terminations.success.params["min_episode_length"] = self.success_min_episode_length
+        else:
+            self.terminations.success = None
 
         # Match the Stage-1 (base) dynamics the expert was trained + evaluated on.
         # The RGB data-collection cfg inherits the Stage-2/sim2real stack (eval OSC

@@ -210,6 +210,12 @@ class ManipulationEncoder(WorldModelEncoderBase):
         self.debug_image_feat_mean_input = nnx.Intermediate(jnp.zeros(()))
         self.debug_image_feat_std_input = nnx.Intermediate(jnp.zeros(()))
         self.debug_latent_norm_input = nnx.Intermediate(jnp.zeros(()))
+        # Writing an Intermediate works under trainer.py's nnx.jit (the module is an
+        # nnx argument, so nnx threads the state out) but NOT under the MPPI planner's
+        # jit, which closes over the model -> TraceContextError "cannot mutate
+        # Intermediate from a different trace level". Inference turns these off; see
+        # mppi_server.build_controller.
+        self.collect_debug_stats = True
 
     def __call__(
         self,
@@ -232,9 +238,10 @@ class ManipulationEncoder(WorldModelEncoderBase):
         )
         # Snapshot debug stats now, before WorldModelLoss's separate encode_latent call
         # (on the future target) overwrites the scratch slots above.
-        self.debug_image_feat_mean_input.value = self.debug_image_feat_mean.value
-        self.debug_image_feat_std_input.value = self.debug_image_feat_std.value
-        self.debug_latent_norm_input.value = self.debug_latent_norm.value
+        if self.collect_debug_stats:
+            self.debug_image_feat_mean_input.value = self.debug_image_feat_mean.value
+            self.debug_image_feat_std_input.value = self.debug_image_feat_std.value
+            self.debug_latent_norm_input.value = self.debug_latent_norm.value
 
         proprio_obs_hist += self.temporal_enc[:-1]
         act_hist += self.temporal_enc[:-1]
@@ -266,8 +273,9 @@ class ManipulationEncoder(WorldModelEncoderBase):
 
         # Capture BEFORE layer_norm_1: post-norm this is pinned at mean=0/std=1 by
         # construction, so it's the raw feature that actually reflects backbone training.
-        self.debug_image_feat_mean.value = feats.mean()
-        self.debug_image_feat_std.value = feats.std()
+        if self.collect_debug_stats:
+            self.debug_image_feat_mean.value = feats.mean()
+            self.debug_image_feat_std.value = feats.std()
 
         feats = self.layer_norm_1(feats)
 
@@ -277,7 +285,8 @@ class ManipulationEncoder(WorldModelEncoderBase):
 
         concatenated = jnp.concatenate([feats, proprio_obs], axis=-1)
         enc_latent = self.latent_mlp(concatenated, deterministic=deterministic)
-        self.debug_latent_norm.value = jnp.linalg.norm(enc_latent, axis=-1).mean()
+        if self.collect_debug_stats:
+            self.debug_latent_norm.value = jnp.linalg.norm(enc_latent, axis=-1).mean()
         return enc_latent
 
 

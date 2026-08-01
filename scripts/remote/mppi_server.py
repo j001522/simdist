@@ -72,6 +72,13 @@ def build_controller(simdist_dir: str, ckpt_dir: str, ctrl_cfg: dict,
         model = models.get_model(model_cfg, mu.make_dummy_scaler_params(model_cfg),
                                  nnx.Rngs(0))
         print("[mppi_server] fresh-init weights (no restore)", flush=True)
+    # The debug Intermediates are written under trainer.py's nnx.jit, where the module
+    # is an nnx argument. MPPI's jit closes over the model instead, so the same writes
+    # raise TraceContextError. Nothing reads them at inference.
+    model.collect_debug_stats = False
+    if getattr(model, "encoder", None) is not None:
+        model.encoder.collect_debug_stats = False
+
     controller = MppiController(model, model_cfg, ctrl_cfg)
     return controller
 
@@ -104,9 +111,13 @@ def main() -> None:
     def handle(msg: dict) -> dict:
         op = msg["op"]
         if op == "build":
+            # A "build" may carry its own ckpt_step, which lets a client swap
+            # checkpoints in-place (the sweep) instead of restarting the server
+            # for every step. Falls back to the --ckpt-step CLI pin.
+            step = msg.get("ckpt_step", args.ckpt_step)
             state["controller"] = build_controller(
                 args.simdist_dir, msg["ckpt_dir"], msg["ctrl_cfg"],
-                restore=not args.fresh, ckpt_step=args.ckpt_step)
+                restore=not args.fresh, ckpt_step=step)
             print("[mppi_server] controller built", flush=True)
             return {"ok": True}
         if op == "echo":

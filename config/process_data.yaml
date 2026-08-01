@@ -6,6 +6,14 @@ history_length: 25
 prediction_length: 25
 
 # Don't include this many steps at the beginning of an episode in the dataset
+# 2026-07-24: 5 -> 0. The 5/5 defaults were sized for the Go2 run (H=T=25 over
+# ~1000-step episodes, where they cost nothing). Manip episodes under
+# stop_on_success average 32 steps, and windows per episode are
+# ep_len - (H+T+beg+end), so 5/5 discarded 45% of the valid windows and dropped
+# every episode shorter than 20 outright (the silent all-episodes-skipped +
+# NaN-scaler failure). Measured on the 07-18 rollouts at H=T=5: 12.18 win/ep at
+# 5/5 vs 22.07 win/ep at 0/0.
+# Note this is a global default: re-processing a Go2 dataset now also uses 0/0.
 beg_padding: 0
 
 # Don't include this many steps at the end of an episode in the dataset
