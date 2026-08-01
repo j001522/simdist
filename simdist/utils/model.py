@@ -94,17 +94,65 @@ def _detach_frozen_trees(model, pure: dict):
     return out
 
 
-def _copy_matching_leaves(dst: dict, src: dict) -> None:
+_MISSING = object()
+
+
+def _children(node):
+    """Child keys of a container node, or None if ``node`` is a leaf.
+
+    Repeated submodules (MLP ``layers``, ResNet ``layer1..4``, transformer blocks)
+    are LISTS in the model's pure dict but come back from a raw orbax restore as
+    DICTS keyed "0", "1", ... Both are containers and must be walked as such.
+    """
+    if isinstance(node, dict):
+        return list(node.keys())
+    if isinstance(node, (list, tuple)):
+        return list(range(len(node)))
+    return None
+
+
+def _get_child(node, k):
+    """Fetch child ``k`` from a dict or sequence, tolerating int/str key skew."""
+    if isinstance(node, dict):
+        if k in node:
+            return node[k]
+        alt = str(k) if isinstance(k, int) else (
+            int(k) if isinstance(k, str) and k.lstrip("-").isdigit() else None
+        )
+        return node[alt] if alt is not None and alt in node else _MISSING
+    if isinstance(node, (list, tuple)):
+        i = k if isinstance(k, int) else (
+            int(k) if isinstance(k, str) and k.lstrip("-").isdigit() else None
+        )
+        return node[i] if i is not None and -len(node) <= i < len(node) else _MISSING
+    return _MISSING
+
+
+def _copy_matching_leaves(dst, src) -> None:
     """Recursively copy leaves from ``src`` into ``dst`` where the same nested
     path exists in both. Leaves present only in ``dst`` keep their value; leaves
-    present only in ``src`` are ignored."""
-    for k, v in src.items():
-        if k not in dst:
+    present only in ``src`` are ignored.
+
+    Driven by ``dst``'s structure, since ``dst`` is what we are filling. It must
+    descend through lists as well as dicts: the previous dict-only version silently
+    skipped every subtree under a list -- which is the whole ResNet, every dynamics
+    block and every MLP -- restoring 38 of 402 leaves and leaving 99.7% of the model
+    at its random init, with no error raised.
+    """
+    keys = _children(dst)
+    if keys is None:
+        return
+    for k in keys:
+        sv = _get_child(src, k)
+        if sv is _MISSING:
             continue
-        if isinstance(v, dict) and isinstance(dst[k], dict):
-            _copy_matching_leaves(dst[k], v)
-        elif not isinstance(v, dict) and not isinstance(dst[k], dict):
-            dst[k] = jnp.asarray(v)
+        dv = _get_child(dst, k)
+        if dv is _MISSING:
+            continue
+        if _children(dv) is not None and _children(sv) is not None:
+            _copy_matching_leaves(dv, sv)
+        elif _children(dv) is None and _children(sv) is None:
+            dst[k] = jnp.asarray(sv)
 
 
 def make_dummy_scaler_params(cfg: dict):
