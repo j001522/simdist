@@ -434,6 +434,9 @@ class Ur5eSim:
               flush=True)
 
         self.pbar.close()
+        # Worst-case total: episodes usually terminate well before max_steps, so the
+        # bar's ETA is an upper bound and the run finishes early. max_steps is the only
+        # bound known up front -- actual episode length depends on termination.
         self.pbar = tqdm(desc="Sweep", unit="step",
                          total=len(steps) * n * self.max_steps)
         for step in steps:
