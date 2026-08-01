@@ -8,7 +8,9 @@ model:
 
 sim:
   num_episodes: 5      # planner episodes to run
-  max_steps: 200       # per-episode step cap (env time_out is 16 s @ 5 Hz = 80 steps)
+  max_steps: 200       # per-episode step cap. Never binds in practice: the env times
+                       # out first at episode_length_s=10 s / 5 Hz (decimation 24 @
+                       # sim.dt=1/120) = 50 steps.
   seed: 42
   # Ur5eRecordEnvCfg's simplified variant: DR off, single grasped reset bank. Must
   # match how the dataset the world model was trained on was collected -- planning
