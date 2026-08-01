@@ -16,6 +16,8 @@ Run via `run_ur5e.sh`, or manually (after starting mppi_server.py):
         model.checkpoint=wm_manip_5hz_ln [hydra overrides]
 """
 import argparse
+import datetime
+import json
 import os
 import socket
 import sys
@@ -50,6 +52,21 @@ parser.add_argument("--expert-iter", type=int, default=1600,
 parser.add_argument("--via-server", action="store_true",
                     help="With --expert: send each action through the server echo op "
                          "(IPC-plumbing test). Without it the expert runs in-process.")
+# Checkpoint sweep: evaluate every step in the run dir in one process. The run is not
+# monotonic across steps, so picking a checkpoint by "latest" is unsound -- this is how
+# you pick one by measured planning performance instead.
+parser.add_argument("--sweep", action="store_true",
+                    help="Evaluate every checkpoint step in the run dir, not just one.")
+parser.add_argument("--sweep-episodes", type=int, default=5,
+                    help="Episodes per checkpoint (default 5).")
+# Comma-separated, not nargs="*": a greedy list would swallow the trailing hydra
+# overrides (they do not start with "-") and then fail to int() them.
+parser.add_argument("--sweep-steps", default=None,
+                    help="Restrict the sweep to these steps, comma-separated "
+                         "(e.g. --sweep-steps 38000,40000). Default: all in the dir.")
+parser.add_argument("--sweep-out", default=None,
+                    help="JSON report path (default: <ckpt_dir>/mppi_sweep.json). "
+                         "The figure is written alongside it as .png.")
 AppLauncher.add_app_launcher_args(parser)
 args, unknown = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + unknown  # keep only unknown args for hydra
@@ -77,6 +94,35 @@ from simdist.rl.manip_simplify import simplify_events  # noqa: E402  (jax-free)
 OBS_GROUP = "data_collection"  # the vision obs group the world model was trained on
 
 
+def plot_sweep(report: dict, png_path: str):
+    """Success rate and mean reward against checkpoint step, one figure."""
+    import matplotlib
+    matplotlib.use("Agg")  # no display: this runs headless
+    import matplotlib.pyplot as plt
+
+    rows = report["steps"]
+    xs = [r["step"] for r in rows]
+    n = report["episodes_per_step"]
+
+    fig, (ax_sr, ax_rw) = plt.subplots(2, 1, sharex=True, figsize=(9, 6.5))
+    ax_sr.plot(xs, [r["success_rate"] for r in rows], marker="o", color="tab:blue")
+    ax_sr.set_ylabel("success rate")
+    # With n episodes the rate can only land on multiples of 1/n, so pin the axis to
+    # [0, 1] -- autoscale on a flat-zero sweep is meaningless and reads as noise.
+    ax_sr.set_ylim(-0.05, 1.05)
+    ax_sr.grid(alpha=0.3)
+
+    ax_rw.plot(xs, [r["mean_reward"] for r in rows], marker="o", color="tab:orange")
+    ax_rw.set_ylabel("mean episode reward")
+    ax_rw.set_xlabel("checkpoint step")
+    ax_rw.grid(alpha=0.3)
+
+    ax_sr.set_title(f"{report['checkpoint']} — MPPI, {n} episodes per checkpoint")
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=150)
+    plt.close(fig)
+
+
 class RemoteController:
     """Mirrors the ControllerBase interface used by the sim loop, forwarding each
     call to the MPPI server over a socket. Holds no JAX state itself."""
@@ -84,7 +130,18 @@ class RemoteController:
     def __init__(self, host, port, ckpt_dir, ctrl_cfg, build=True):
         self.sock = socket.create_connection((host, port))
         if build:
-            self._call({"op": "build", "ckpt_dir": ckpt_dir, "ctrl_cfg": ctrl_cfg})
+            self.build(ckpt_dir, ctrl_cfg)
+
+    def build(self, ckpt_dir, ctrl_cfg, ckpt_step=None):
+        """(Re)build the server-side controller, optionally pinning a checkpoint step.
+
+        The sweep calls this once per checkpoint so both processes stay up across the
+        whole run -- rebuilding costs a model load plus a jit warm, against ~2 min of
+        Isaac startup for a fresh process."""
+        msg = {"op": "build", "ckpt_dir": ckpt_dir, "ctrl_cfg": ctrl_cfg}
+        if ckpt_step is not None:
+            msg["ckpt_step"] = ckpt_step
+        self._call(msg)
 
     def _call(self, msg):
         ipc.send_msg(self.sock, msg)
@@ -129,6 +186,7 @@ class Ur5eSim:
         ckpt_dir = os.path.join(
             paths.get_model_checkpoints_dir(), self.cfg["model"]["checkpoint"]
         )
+        self.ckpt_dir = ckpt_dir
         model_cfg = OmegaConf.to_container(
             OmegaConf.load(os.path.join(ckpt_dir, paths.get_model_config_filename())),
             resolve=True,
@@ -145,8 +203,11 @@ class Ur5eSim:
         # is routed through the server for the IPC-plumbing test.
         self.controller = None
         if not args.expert:
+            # In sweep mode the per-checkpoint build happens in run_sweep, so skip the
+            # default build here rather than loading a model we immediately discard.
             self.controller = RemoteController(
-                mppi_host, mppi_port, ckpt_dir, self.cfg["control"]
+                mppi_host, mppi_port, ckpt_dir, self.cfg["control"],
+                build=not args.sweep,
             )
         elif args.via_server:
             self.controller = RemoteController(
@@ -176,7 +237,7 @@ class Ur5eSim:
         # cmd is zero-width for manipulation
         self.zero_cmd = np.zeros((0,), dtype=np.float32)
         self.zero_action = np.zeros((self.act_dim,), dtype=np.float32)
-        if self.expert is None:
+        if self.expert is None and not args.sweep:
             x = self.get_controller_input(self.zero_action)
             self.controller.initialize(x, self.zero_cmd)
             self.controller.reset(x, self.zero_cmd)
@@ -246,11 +307,14 @@ class Ur5eSim:
         return float(self.progress.xyz_distance[0]), bool(self.progress.success[0])
 
     def run(self):
-        for ep in range(self.num_episodes):
-            if not simulation_app.is_running():
-                break
-            self.run_episode(ep)
-        self.logging()
+        if args.sweep:
+            self.run_sweep()
+        else:
+            for ep in range(self.num_episodes):
+                if not simulation_app.is_running():
+                    break
+                self.run_episode(ep)
+            self.logging()
         if self.controller is not None:
             self.controller.close()
         self.env.close()
@@ -320,7 +384,7 @@ class Ur5eSim:
     def logging(self):
         n = len(self.episode_stats)
         if n == 0:
-            return
+            return None
         mean = lambda k: float(np.mean([s[k] for s in self.episode_stats]))  # noqa: E731
         metrics = {
             "success_rate": sum(s["success"] for s in self.episode_stats) / n,
@@ -331,6 +395,79 @@ class Ur5eSim:
             "num_episodes": n,
         }
         print(metrics)
+        return metrics
+
+    @staticmethod
+    def discover_steps(ckpt_dir: str):
+        """Checkpoint step dirs, ascending. Orbax writes one numeric dir per step
+        alongside model_config.yaml, so numeric-and-directory is the whole test."""
+        return sorted(
+            int(d) for d in os.listdir(ckpt_dir)
+            if d.isdigit() and os.path.isdir(os.path.join(ckpt_dir, d))
+        )
+
+    def run_sweep(self):
+        steps = self.discover_steps(self.ckpt_dir)
+        if args.sweep_steps:
+            wanted = {int(s) for s in args.sweep_steps.split(",") if s.strip()}
+            missing = wanted - set(steps)
+            if missing:
+                raise SystemExit(f"no such checkpoint step(s): {sorted(missing)}")
+            steps = [s for s in steps if s in wanted]
+        if not steps:
+            raise SystemExit(f"no checkpoint step dirs under {self.ckpt_dir}")
+
+        n = args.sweep_episodes
+        self.num_episodes = n  # so run_episode's per-episode print reads correctly
+        out_path = args.sweep_out or os.path.join(self.ckpt_dir, "mppi_sweep.json")
+        report = {
+            "checkpoint": self.cfg["model"]["checkpoint"],
+            "checkpoint_dir": self.ckpt_dir,
+            "episodes_per_step": n,
+            "max_steps": self.max_steps,
+            "created": datetime.datetime.now().isoformat(timespec="seconds"),
+            "sim": self.cfg["sim"],
+            "control": self.cfg["control"],
+            "steps": [],
+        }
+        print(f"[sweep] {len(steps)} checkpoints x {n} episodes -> {out_path}",
+              flush=True)
+
+        self.pbar.close()
+        self.pbar = tqdm(desc="Sweep", unit="step",
+                         total=len(steps) * n * self.max_steps)
+        for step in steps:
+            if not simulation_app.is_running():
+                print(f"[sweep] app closed, stopping before step {step}", flush=True)
+                break
+            print(f"\n[sweep] ===== checkpoint step {step} =====", flush=True)
+            self.controller.build(self.ckpt_dir, self.cfg["control"], step)
+            # A rebuild returns a fresh MppiController: its ring buffer and jit caches
+            # have to be primed again before run_episode's reset.
+            x = self.get_controller_input(self.zero_action)
+            self.controller.initialize(x, self.zero_cmd)
+
+            self.episode_stats = []
+            for ep in range(n):
+                if not simulation_app.is_running():
+                    break
+                self.run_episode(ep)
+            metrics = self.logging()
+            if metrics is not None:
+                report["steps"].append({"step": step, **metrics})
+                report["episodes"] = report.get("episodes", {})
+                report["episodes"][str(step)] = list(self.episode_stats)
+                # Rewrite after every checkpoint: a sweep is long and a kill partway
+                # should still leave a usable report.
+                with open(out_path, "w") as f:
+                    json.dump(report, f, indent=2)
+
+        print(f"[sweep] wrote {out_path}", flush=True)
+        if report["steps"]:
+            png = os.path.splitext(out_path)[0] + ".png"
+            plot_sweep(report, png)
+            print(f"[sweep] wrote {png}", flush=True)
+        return report
 
 
 @hydra.main(**paths.get_simulate_ur5e_hydra_config())
