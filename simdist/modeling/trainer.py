@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import random_split, get_worker_info, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import flax.nnx as nnx
+import jax
 import orbax.checkpoint as ocp
 import optax
 from tqdm import tqdm
@@ -215,15 +216,50 @@ def train(cfg: dict):
         decay_steps=decay_steps,
         end_value=train_cfg["end_learning_rate"],
     )
+    # Discriminative LR for a fine-tuned DINOv2 backbone. A ViT adapted at the head LR
+    # (2e-4 here) is destroyed within a few hundred steps; the standard recipe is 1/10 to
+    # 1/100 of it. This HAS to happen in the optimizer: scaling the gradient inside the
+    # module instead would do nothing, because Adam normalizes by gradient RMS.
+    dino_cfg = (
+        (cfg["model"].get("encoder", {}) or {}).get("extero_obs", {}) or {}
+    ).get("dinov2") or {}
+    backbone_lr_mult = float(dino_cfg.get("lr_mult", 1.0))
+    if int(dino_cfg.get("trainable_blocks", 0) or 0) > 0 and backbone_lr_mult != 1.0:
+
+        def backbone_sched(step):
+            return lr_sched(step) * backbone_lr_mult
+
+        def label_backbone(params):
+            # BackboneParam lives under encoder.dinov2, so the path is the label.
+            return jax.tree_util.tree_map_with_path(
+                lambda path, _: (
+                    "backbone" if "dinov2" in jax.tree_util.keystr(path) else "main"
+                ),
+                params,
+            )
+
+        base_tx = optax.multi_transform(
+            {"backbone": optax.adam(backbone_sched), "main": optax.adam(lr_sched)},
+            label_backbone,
+        )
+        print(
+            f"Discriminative LR: DINOv2 backbone at {backbone_lr_mult}x the head LR "
+            f"(peak {train_cfg['learning_rate'] * backbone_lr_mult:.2e})"
+        )
+    else:
+        base_tx = optax.adam(lr_sched)
+
     # Optional gradient clipping (global-norm). A moving, unnormalized latent-dynamics
     # target can spike on a bad batch and permanently inflate the latent scale; clipping
     # bounds that. Off by default (grad_clip_norm=None) -> Go2 behaviour unchanged.
+    # Chained OUTSIDE multi_transform so the norm stays global; inside, each group would
+    # be clipped against its own norm, which is not the existing semantics.
     grad_clip_norm = train_cfg.get("grad_clip_norm")
     if grad_clip_norm is not None:
-        tx = optax.chain(optax.clip_by_global_norm(grad_clip_norm), optax.adam(lr_sched))
+        tx = optax.chain(optax.clip_by_global_norm(grad_clip_norm), base_tx)
         print(f"Gradient clipping enabled: global-norm {grad_clip_norm}")
     else:
-        tx = optax.adam(lr_sched)
+        tx = base_tx
     optimizer = nnx.Optimizer(model, tx, wrt=filt)
     metrics = nnx.MultiMetric(
         loss=nnx.metrics.Average("loss"),

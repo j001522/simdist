@@ -44,6 +44,18 @@ encoder:
       # Staged by scripts/stage_dinov2_weights.py (login node -- compute nodes have no
       # network). Resolution-specific: the position embedding is baked at 224px.
       weights: dinov2-small-224.npz
+      # Partial fine-tuning: adapt the last K of 12 transformer blocks (+ the final
+      # layernorm); embeddings and the earlier blocks stay frozen. 0 = fully frozen,
+      # which is byte-identical to the pre-fine-tuning branch and the only setting that
+      # can resume from a frozen-run checkpoint (K>0 adds a state node).
+      # K=4 -> 7.10M trainable backbone params of 21.6M. Freezing the prefix is also
+      # what keeps this in memory: JAX stages no backward residuals for blocks whose
+      # inputs and params are all outside the DiffState.
+      trainable_blocks: 4
+      # Backbone LR as a fraction of the head LR, applied via optax.multi_transform in
+      # trainer.py. At 1.0 the ViT is destroyed in a few hundred steps; 1/10-1/100 is the
+      # standard range. 2e-4 * 0.05 = 1e-5 peak.
+      lr_mult: 0.05
     # cls_mean concatenates two blocks with different natural scales; normalize each
     # separately rather than with one shared statistic. See ManipulationEncoder.
     feature_norm: blockwise
