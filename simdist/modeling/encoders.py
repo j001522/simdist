@@ -190,9 +190,54 @@ class ManipulationEncoder(WorldModelEncoderBase):
             output_dim=self.latent_dim,
             rngs=rngs,
         )
-        # concat = [3x512 image feats, raw 6 joint obs] -> z(latent_dim)
+        # Proprio branch into the LATENT (distinct from the history path above, which
+        # keeps its own projection to latent_dim for the transformer tokens).
+        #
+        # `proprio_embed_dim` absent/null/0 reproduces the paper's raw concat: the 6 joint
+        # obs enter latent_mlp unprojected, i.e. 6 of 1542 (ResNet) or 6 of 2310 (DINOv2
+        # cls_mean) input dims -- 0.26-0.39%. Scale is NOT the problem (proprio is already
+        # scaler-standardised to ~unit std and the image blocks are affine-free
+        # LayerNormed to exactly unit std); the first Linear is lecun_normal, so every
+        # input dim contributes equal variance and proprio's share of the pre-activation
+        # variance is just its share of the dims. It is a dimension-count problem, which
+        # is why the existing debug/proprio_scaled_std vs debug/image_feat_std pair cannot
+        # see it.
+        #
+        # Setting it projects proprio to its own block first, so the concat is
+        # [n_cam blocks of images | 1 block of proprio]. "image" sizes that block to
+        # per_image_embed_dim, i.e. proprio counts as one more camera: 512 (ResNet),
+        # 384 (DINOv2 `cls`), 768 (DINOv2 `cls_mean`) -> a 20-25% share.
+        #
+        # This also moves the PREDICTION TARGET: losses.py encodes the future obs through
+        # this same encode_latent, so under the raw concat the latent-dynamics target is
+        # ~99.7% image and the dynamics head is barely graded on joint motion at all.
+        #
+        # Old checkpoints are unaffected -- load_model_from_ckpt rebuilds from each run's
+        # own model_config.yaml snapshot, which predates this key. New runs are a
+        # different state layout and deliberately cannot resume from them.
+        self.proprio_embed_dim = self._resolve_proprio_embed_dim(
+            self.enc_cfg.get("proprio_embed_dim")
+        )
+        if self.proprio_embed_dim:
+            # Depth/width reuse `proprio_obs_layers` and h_size for parity with
+            # proprio_obs_proj. Deliberately NOT weight-shared with it: that one is
+            # pinned to latent_dim by the history tokens, and its representation serves a
+            # different role (a sequence token, with temporal/type encodings added).
+            # Deliberately not a bare Linear either -- a linear 6->512 is rank-6, so it
+            # rebalances the init variance but adds no capacity; the gelu MLP does.
+            self.proprio_latent_proj = modules.MLP(
+                input_dim=self.proprio_obs_dim,
+                hidden_dims=[h_size] * self.enc_cfg["proprio_obs_layers"],
+                output_dim=self.proprio_embed_dim,
+                rngs=rngs,
+            )
+        else:
+            self.proprio_latent_proj = None
+        proprio_block_dim = self.proprio_embed_dim or self.proprio_obs_dim
+
+        # concat = [n_cam x per_image_embed_dim image feats, proprio block] -> z(latent_dim)
         self.latent_mlp = modules.MLP(
-            input_dim=self.n_cam * self.per_image_embed_dim + self.proprio_obs_dim,
+            input_dim=self.n_cam * self.per_image_embed_dim + proprio_block_dim,
             hidden_dims=[h_size] * self.enc_cfg["latent_layers"],
             output_dim=self.latent_dim,
             rngs=rngs,
@@ -252,6 +297,41 @@ class ManipulationEncoder(WorldModelEncoderBase):
             self.latent_dim, use_scale=False, use_bias=False, rngs=rngs
         )
 
+        # Normalization of the PROJECTED proprio block, so the whole point of the
+        # projection -- a balanced concat -- isn't undone by the projection's own output
+        # scale (a 2-layer gelu MLP lands near std 0.5, not 1, so without this the block
+        # arrives at ~1/4 the per-feature variance of each LayerNormed image block).
+        # Affine-free like the image norms, for the same reason: a learnable gamma would
+        # let the encoder re-inflate or re-deflate the branch.
+        #
+        # Caveat worth knowing before reading an ablation: LayerNorm removes the
+        # mean-over-features and the norm, which with only 6 informative inputs is a
+        # meaningful fraction of the signal (the 2-layer gelu makes those nonlinear
+        # functions of the joints rather than one clean linear direction, which dilutes
+        # but does not eliminate the cost). Hence `proprio_norm: none` as an escape hatch:
+        # it keeps every dof at the price of an unguaranteed scale match.
+        # NEVER normalize the RAW 6-vector -- there it would delete real joint signal, and
+        # the scaler has already standardised it per-dim anyway.
+        self.proprio_norm = self.enc_cfg.get(
+            "proprio_norm", "layernorm" if self.proprio_embed_dim else "none"
+        )
+        if self.proprio_norm not in ("layernorm", "none"):
+            raise ValueError(f"unknown proprio_norm {self.proprio_norm!r}")
+        if self.proprio_norm == "layernorm" and not self.proprio_embed_dim:
+            raise ValueError(
+                "proprio_norm='layernorm' requires proprio_embed_dim to be set; "
+                "normalizing the raw proprio vector would discard joint signal."
+            )
+        # Affine-free LayerNorm has no parameters, so creating this conditionally does not
+        # change the checkpointed state layout either way.
+        self.layer_norm_proprio = (
+            nnx.LayerNorm(
+                self.proprio_embed_dim, use_scale=False, use_bias=False, rngs=rngs
+            )
+            if self.proprio_norm == "layernorm"
+            else None
+        )
+
         # Debug-only captures for TensorBoard (see trainer.py's "debug/" metrics). Plain
         # nnx.Intermediate state -- same mechanism nnx.BatchNorm uses for its running
         # stats, so it's inert to grads/optimizer.update and doesn't touch any existing
@@ -275,6 +355,35 @@ class ManipulationEncoder(WorldModelEncoderBase):
         self.debug_image_feat_mean_input = nnx.Intermediate(jnp.zeros(()))
         self.debug_image_feat_std_input = nnx.Intermediate(jnp.zeros(()))
         self.debug_latent_norm_input = nnx.Intermediate(jnp.zeros(()))
+        # Proprio block as it ARRIVES AT THE CONCAT (post-projection, pre-LayerNorm), so
+        # it is directly comparable against debug_image_feat_* above -- that is the pair
+        # that says whether the two branches actually reach latent_mlp balanced. Under
+        # the raw-concat default this just restates debug/proprio_scaled_*.
+        self.debug_proprio_feat_mean = nnx.Intermediate(jnp.zeros(()))
+        self.debug_proprio_feat_std = nnx.Intermediate(jnp.zeros(()))
+        self.debug_proprio_feat_mean_input = nnx.Intermediate(jnp.zeros(()))
+        self.debug_proprio_feat_std_input = nnx.Intermediate(jnp.zeros(()))
+
+    def _resolve_proprio_embed_dim(self, value) -> int:
+        """`encoder.proprio_embed_dim` -> width of the proprio block, 0 = raw concat.
+
+        Accepts None/0/"none" (disabled, the pre-existing behaviour), the string "image"
+        (match per_image_embed_dim, i.e. proprio counts as one more camera), or an int.
+        """
+        if value is None or value == 0 or value == "none":
+            return 0
+        if value == "image":
+            return int(self.per_image_embed_dim)
+        try:
+            dim = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"proprio_embed_dim must be null, 'none', 'image' or an int, "
+                f"got {value!r}"
+            ) from None
+        if dim < 0:
+            raise ValueError(f"proprio_embed_dim must be >= 0, got {dim}")
+        return dim
 
     def __call__(
         self,
@@ -300,6 +409,8 @@ class ManipulationEncoder(WorldModelEncoderBase):
         self.debug_image_feat_mean_input.value = self.debug_image_feat_mean.value
         self.debug_image_feat_std_input.value = self.debug_image_feat_std.value
         self.debug_latent_norm_input.value = self.debug_latent_norm.value
+        self.debug_proprio_feat_mean_input.value = self.debug_proprio_feat_mean.value
+        self.debug_proprio_feat_std_input.value = self.debug_proprio_feat_std.value
 
         proprio_obs_hist += self.temporal_enc[:-1]
         act_hist += self.temporal_enc[:-1]
@@ -348,7 +459,21 @@ class ManipulationEncoder(WorldModelEncoderBase):
             feats.shape[:-2] + (self.n_cam * self.per_image_embed_dim,)
         )
 
-        concatenated = jnp.concatenate([feats, proprio_obs], axis=-1)
+        # Proprio block: raw (paper default) or projected to its own camera-sized block.
+        if self.proprio_latent_proj is not None:
+            proprio_feat = self.proprio_latent_proj(
+                proprio_obs, deterministic=deterministic
+            )
+        else:
+            proprio_feat = proprio_obs
+        # Captured pre-norm, mirroring the image feats above: post-LayerNorm this is
+        # pinned at mean=0/std=1 by construction and could never show anything moving.
+        self.debug_proprio_feat_mean.value = proprio_feat.mean()
+        self.debug_proprio_feat_std.value = proprio_feat.std()
+        if self.layer_norm_proprio is not None:
+            proprio_feat = self.layer_norm_proprio(proprio_feat)
+
+        concatenated = jnp.concatenate([feats, proprio_feat], axis=-1)
         enc_latent = self.latent_mlp(concatenated, deterministic=deterministic)
         self.debug_latent_norm.value = jnp.linalg.norm(enc_latent, axis=-1).mean()
         enc_latent = self.layer_norm_2(enc_latent)

@@ -322,6 +322,17 @@ def train(cfg: dict):
             stats["debug/image_feat_std"] = float(
                 model.encoder.debug_image_feat_std_input.value
             )
+        # The proprio block as latent_mlp receives it (post-projection, pre-LayerNorm).
+        # Read against image_feat_* this is the balance metric: proprio_scaled_* above
+        # describes the 6 raw inputs, which says nothing about how much of the concat
+        # they occupy once the projection is on.
+        if hasattr(model.encoder, "debug_proprio_feat_mean_input"):
+            stats["debug/proprio_feat_mean"] = float(
+                model.encoder.debug_proprio_feat_mean_input.value
+            )
+            stats["debug/proprio_feat_std"] = float(
+                model.encoder.debug_proprio_feat_std_input.value
+            )
         return stats
 
     def log_debug_stats(prefix: str, samples: list[dict[str, float]]) -> None:
