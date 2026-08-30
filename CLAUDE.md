@@ -158,6 +158,72 @@ python scripts/simulate_go2.py model.checkpoint=<checkpoint>
 
 `generate_data.yaml` mixes the expert (iter 4999) at 50% with non-expert iterations 0..2000 and applies bursty action corruption — important for world-model coverage.
 
+## Proprioception projection (branch `proprio-projection`)
+
+`ManipulationEncoder.encode_latent` originally concatenated the **raw** 6 joint obs onto
+the flattened image features. That leaves proprio at 0.26–0.52 % of `latent_mlp`'s input
+dims (2310 for DINOv2 `cls_mean`, 1542 for ResNet-18, 1158 for DINOv2 `cls`).
+
+**It is a dimension problem, not a scale one.** Proprio is already scaler-standardised to
+~unit std (`models.py:190`) and each image block is affine-free LayerNormed to exactly
+unit std; the first `Linear` is lecun_normal (var = 1/fan_in), so every input dim
+contributes equal variance and proprio's share of the pre-activation variance is just its
+share of the dims. This is exactly why the existing `debug/proprio_scaled_std` vs
+`debug/image_feat_std` pair looks healthy and shows nothing.
+
+`model.encoder.proprio_embed_dim` fixes the count:
+
+| value | effect |
+|---|---|
+| absent / `null` / `none` | raw concat — the pre-branch behaviour, byte-identical |
+| `image` | project to `per_image_embed_dim`; proprio becomes one more camera-sized block → **25 % of input dims for every backbone** (512 ResNet, 384 DINOv2 `cls`, 768 `cls_mean`) |
+| an int | that width directly |
+
+Costs +148k params (ResNet) / +214k (DINOv2 `cls_mean`). Both manip model YAMLs now default
+to `image`.
+
+Four things worth knowing:
+
+1. **`proprio_norm: layernorm` is not cosmetic.** Measured at init the projected block
+   arrives at std 0.16 against the image blocks' 1.0 — without it, ~6× of the
+   variance-per-feature balance the projection just bought is handed straight back.
+   Affine-free like the image norms, so a learnable gamma can't re-inflate the branch.
+   `proprio_norm: none` is the escape hatch: LayerNorm removes the mean-over-features and
+   the norm, which with only 6 informative inputs is a real fraction of the signal (the
+   2-layer gelu makes those nonlinear functions of the joints, which dilutes but doesn't
+   eliminate the cost). **Never** normalize the raw 6-vector.
+2. **Not weight-shared with `proprio_obs_proj`.** That one is pinned to `latent_dim` by the
+   history tokens and its representation plays a different role (a sequence token, with
+   temporal/type encodings added). `QuadrupedEncoder` *does* share, which is why the Go2
+   path was already balanced 64/64 — the manip encoder was the outlier, following the
+   paper's literal "concat the 6 joint obs".
+3. **Not a bare `Linear`.** A linear 6→512 is rank-6: it rebalances init variance but adds
+   no capacity. The projection reuses `proprio_obs_layers`/`h_size` for a 2-layer gelu MLP.
+4. **This moves the prediction TARGET, not just the input.** `losses.py` encodes the future
+   obs through the same `encode_latent`, so under the raw concat the latent-dynamics target
+   is ~99.7 % image and the dynamics head is barely graded on joint motion. Standing
+   suspect for `latent_dynamics` flooring at ~0.07 across all six encoders in the
+   2026-07-31 sweep and for rollout error being encoder-independent.
+
+Old checkpoints are unaffected: `load_model_from_ckpt` rebuilds from each run's own
+`model_config.yaml` snapshot, which predates the key. New runs are a different state layout
+and deliberately cannot resume from them.
+
+New TensorBoard metrics `debug/proprio_feat_{mean,std}` report the proprio block **as
+`latent_mlp` receives it** (post-projection, pre-LayerNorm); read against
+`debug/image_feat_*` that pair is the actual balance metric.
+
+Launcher: `train_wm_proprio_proj.sbatch` (4 arms: ResNet/DINOv2-`cls`-ft × projected/raw;
+default `--array=0-1` runs the two projected arms against the existing
+`wm_resnet_l*_26096399` / `wm_dinoft_cls_l*_26096400` baselines — the raw arm on this
+branch is numerically identical to those, since the only diff on that path is two extra
+`nnx.Intermediate` debug scalars that never enter the loss or the checkpoint).
+
+**Not addressed here, and probably the bigger lever:** `system/ur5e.yaml` defines proprio
+as `arm_joint_pos` alone — no joint velocity, no EE pose, no gripper state, no wrench. For
+insertion, EE pose and contact wrench are the channels carrying the signal. Adding them
+costs a dataset regeneration (processor + scaler stats).
+
 ## Adapting to AIC (UR5e cable insertion)
 
 The IsaacLab side here is **Go2-specific** (`simdist/rl/go2.py`, `go2_mdp.py`, `quadruped_world_model.yaml`, `system/go2.yaml`). To target the AIC challenge we need analogous files for a UR5e cable-insertion env. That env is the role of the sibling `aic_utils` extension and `UWLab` (which already provides the UR5e + OmniReset manipulation tasks).
