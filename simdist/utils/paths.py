@@ -12,6 +12,9 @@ _PATHS = {
     "SIM_DATASETS": os.path.join(SIMDIST_ROOT_PATH, "datasets", "sim"),
     "REAL_DATASETS": os.path.join(SIMDIST_ROOT_PATH, "datasets", "real"),
     "MODEL_CHECKPOINTS": os.path.join(SIMDIST_ROOT_PATH, "checkpoints", "models"),
+    # Debug pixel decoders, trained post-hoc on a frozen world-model checkpoint. Kept
+    # out of MODEL_CHECKPOINTS so load_model_from_ckpt can never pick one up by name.
+    "DECODER_CHECKPOINTS": os.path.join(SIMDIST_ROOT_PATH, "checkpoints", "decoders"),
     # Staged pretrained weights (e.g. DINOv2 .npz). Compute nodes have no outbound
     # network, so anything fetched from the internet is downloaded on a login node and
     # read from here at train time.
@@ -31,6 +34,7 @@ _FILENAMES = {
     "EXPERT_POLICY_FLAG_FILE_NAME": "expert_policy_flag.hdf5",
     "SCALER_PARAMS_FILE_NAME": "scaler_params.json",
     "MODEL_CONFIG_FILE_NAME": "model_config.yaml",
+    "DECODER_CONFIG_FILE_NAME": "decoder_config.yaml",
 }
 
 
@@ -126,6 +130,10 @@ def get_aggregate_realworld_data_hydra_config():
 
 def get_finetune_model_hydra_config():
     return {"config_path": get_config_dir(), "config_name": "finetune_model"}
+
+
+def get_train_decoder_hydra_config():
+    return {"config_path": get_config_dir(), "config_name": "train_decoder"}
 
 
 def get_sim_dataset_dir(dataset_name: str):
@@ -237,6 +245,16 @@ def get_model_config_filename():
 def get_model_checkpoints_dir():
     """Get the directory for model checkpoints."""
     return _PATHS["MODEL_CHECKPOINTS"]
+
+
+def get_decoder_config_filename():
+    """Get the filename for the debug-decoder config file."""
+    return _FILENAMES["DECODER_CONFIG_FILE_NAME"]
+
+
+def get_decoder_checkpoints_dir():
+    """Get the directory for debug pixel-decoder checkpoints."""
+    return _PATHS["DECODER_CHECKPOINTS"]
 
 
 def get_control_config_dir():

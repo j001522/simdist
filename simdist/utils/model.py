@@ -10,7 +10,7 @@ import orbax.checkpoint as ocp
 
 from simdist.data.dataset import DatasetBatch
 from simdist.utils import paths
-from simdist.modeling import models
+from simdist.modeling import models, pixel_decoder
 
 
 T = TypeVar("T")
@@ -82,6 +82,56 @@ def load_model_from_ckpt(
     model = nnx.merge(graphdef, model_state, intermediate_state)
 
     return model, model_cfg, step
+
+
+def read_decoder_config(ckpt_dir: str) -> dict:
+    """The decoder run's own config record, written by ``decoder_trainer.train``.
+
+    Carries the world model it was trained against (``world_model.run_name`` and the
+    ``resolved_step`` that was actually loaded), so a decoder checkpoint is enough to
+    reconstruct the exact pair.
+    """
+    cfg_path = os.path.join(ckpt_dir, paths.get_decoder_config_filename())
+    if not os.path.exists(cfg_path):
+        raise FileNotFoundError(f"No decoder config at {cfg_path}.")
+    return OmegaConf.to_container(OmegaConf.load(cfg_path), resolve=True)
+
+
+def load_decoder_from_ckpt(
+    ckpt_dir: str,
+    latent_dim: int,
+    n_cam: int,
+    image_size: int,
+    step: int | None = None,  # if none, load the latest
+) -> Tuple[nnx.Module, dict, int]:
+    """Restore a debug pixel decoder. The shape args come from the world model it was
+    trained on -- ``decoder_config.yaml`` records ``latent_dim`` but not the camera
+    count or resolution, which are properties of the system config."""
+    if not os.path.exists(ckpt_dir):
+        raise FileNotFoundError(f"Decoder checkpoint directory {ckpt_dir} not found.")
+
+    dec_cfg = read_decoder_config(ckpt_dir)
+    decoder = pixel_decoder.get_decoder(
+        dec_cfg["decoder"],
+        latent_dim=latent_dim,
+        n_cam=n_cam,
+        image_size=image_size,
+        rngs=nnx.Rngs(0),
+    )
+    # Same filter the trainer saved under, so the trees match leaf for leaf.
+    graphdef, decoder_state = nnx.split(decoder, nnx.Not(nnx.Intermediate))
+    with ocp.CheckpointManager(
+        ckpt_dir, options=ocp.CheckpointManagerOptions(read_only=True)
+    ) as mngr:
+        if step is None:
+            step = mngr.latest_step()
+        restored_pure_dict = mngr.restore(
+            step,
+            args=ocp.args.StandardRestore(item=decoder_state.to_pure_dict()),
+        )
+
+    _replace_by_pure_dict(decoder_state, restored_pure_dict)
+    return nnx.merge(graphdef, decoder_state), dec_cfg, step
 
 
 def _replace_by_pure_dict(model_state: nnx.State, pure_dict: dict) -> None:

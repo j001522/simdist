@@ -1,0 +1,19 @@
+# DINO-WM's transposed-conv decoder (models/decoder/transposed_conv.py), ported to
+# flax nnx in simdist/modeling/pixel_decoder.py. Their own config is depth 64 /
+# kernel 5 / stride 3 at 224x224 (conf/decoder/transposed_conv.yaml).
+type: transposed_conv
+
+# Channel multiplier: the stack runs depth*32 -> *8 -> *4 -> *2 -> *1 -> n_cam*3.
+# depth=64 (DINO-WM's value) is ~31M params at latent_dim=256, almost all of it in the
+# first transposed conv (2048->512 at kernel 5). depth=32 is ~8M and plenty for a
+# probe -- the bottleneck on reconstruction quality is z, not the decoder.
+depth: 32
+kernel_size: 5
+stride: 3
+channels: 3
+
+# shared = one transposed-conv stack for every camera, split only at the last layer's
+#          channel axis (0.05% of the parameters are camera-specific at depth 64).
+# split  = one full stack per camera: n_cam x parameters, n_cam x decode cost, no
+#          superposition of viewpoints in shared feature maps.
+head_mode: shared
