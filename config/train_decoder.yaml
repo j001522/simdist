@@ -1,0 +1,65 @@
+# Debug pixel decoder: z -> camera images, trained POST-HOC on a frozen world-model
+# checkpoint. Nothing here can change the world model -- the decoder's gradient never
+# reaches it (see simdist/modeling/decoder_trainer.py).
+#
+# There is no `system:`/`model:` group here on purpose: the system, the dataset schema
+# and H/T are read from the world model's own model_config.yaml, so the decoder cannot
+# be trained against data its encoder never saw.
+defaults:
+  - decoder: transposed_conv
+  - _self_
+
+run_name:
+
+world_model:
+  # Directory name under checkpoints/models/. Required.
+  run_name:
+  # Which checkpoint step to probe; null = latest.
+  step:
+
+data:
+  # null = the dataset the world model was trained on (read from its config). Override
+  # only to probe generalization to a different dataset.
+  dataset_name:
+  # Augmentation off by default: we are asking what z retains about the actual scene,
+  # and colour-jittered/blurred/cropped targets only add noise to that question. Turn
+  # on to reproduce exactly what the encoder saw during world-model training.
+  augment: false
+  num_train_workers: 12
+  num_test_workers: 4
+  prefetch_factor: 2
+
+# No `loss:` group: there is exactly one term, plain MSE of decoder(E(o_t)) against the
+# frame at t, on images in [0, 1]. Fitting the decoder on the dynamics' predicted
+# latents as well would let it absorb dynamics error and make rollouts look better than
+# they are; rollouts are decoded at eval time instead (scripts/render_wm_rollout.py).
+
+training:
+  num_epochs: 1
+  max_steps:
+  eval_interval: 1000
+  # Cap the eval pass. The test split is 1% of ~2.2M windows -> ~345 batches at batch
+  # 64, and a full pass at every eval would cost a third of the run. null = full pass.
+  max_eval_batches: 100
+  # Higher than the world model's 2e-4: this is a small conv stack trained from
+  # scratch, with no pretrained backbone to destroy.
+  learning_rate: 0.0005
+  warmup_ratio: 0.05
+  end_learning_rate: 1e-5
+  grad_clip_norm: 1.0
+  # No backbone BACKWARD here (the world model is frozen and outside the gradient
+  # graph), so the binding cost is the decoder's own activations -- at rollout_weight>0
+  # each step decodes batch_size*(1+T) images.
+  batch_size: 64
+  training_data_ratio: 0.99
+  seed: 42
+
+samples:
+  # A target/reconstruction contact sheet is written to
+  # checkpoints/decoders/<run>/samples/ at every eval. Looking at these is the point.
+  num_rows: 4
+
+checkpoint:
+  enabled: True
+  max_to_keep: 5
+  keep_period:
