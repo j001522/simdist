@@ -1,0 +1,46 @@
+# simdist-jax: pure-JAX world-model TRAINING env (stage 3).
+#
+# No Isaac. Runs scripts/train_model.py + the dataset/modeling stack on Snellius
+# (A100 or H100). process_data still runs in the apptainer (./isaaclab.sh) because
+# its JPEG *write* handler subclasses isaaclab's HDF5 handler; the read/decode path
+# (simdist/data/jpeg_io.py) is Isaac-free and lives here.
+#
+# Version choice is API-compat + wheel availability ONLY (not results): jax and flax
+# must be a compatible PAIR matching the flax *nnx* API the branch code was ported to.
+# This env is Snellius-only and independent of the Spark, so it is NOT bound to any Spark
+# pin -- but the nnx port was validated under flax 0.12.7 + jax 0.10.1 (py3.12) on the
+# Spark, so we replicate that exact pair here (CUDA12 wheels instead of the Spark's CPU
+# aarch64). This is newer than simdist's stale pyproject pins (jax 0.6.0 / flax 0.10.4 /
+# py3.10); the branch moved past those, so DO NOT downgrade to match pyproject.
+#
+# optax / orbax-checkpoint / numpy are left to the resolver: flax 0.12.7 requires newer
+# versions than simdist's old pins (optax 0.2.4 / orbax 0.11.25 / numpy 1.26.4), which
+# would conflict. If simdist data code (scaler/data_processor) breaks on numpy 2.x,
+# pin numpy<2 and re-resolve.
+#
+# Create:  conda env create -f environment_jax.yml
+#          conda activate simdist-jax
+#          pip install -e . --no-deps      # simdist package, skip Isaac deps
+name: simdist-jax
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12                    # jax 0.10 dropped py3.10; no Isaac here so 3.10 pin N/A
+  - pip
+  - pip:
+      # --- JAX stack: validated pair (Spark), CUDA12 wheels for Snellius H100 ---
+      - "jax[cuda12]==0.10.1"
+      - flax==0.12.7
+      - optax                      # floated: flax 0.12.7 pulls a compatible version
+      - orbax-checkpoint           # floated: idem
+      # --- data / config / logging ---
+      - h5py
+      - hydra-core==1.3.2
+      - opencv-python-headless     # cv2 for JPEG decode (jpeg_io.py)
+      - wandb
+      - tqdm
+      # --- dataloader only: CPU torch build. The default CUDA build hard-pins
+      # nvidia-cudnn-cu12==9.1.0.70, which clashes with jax-cuda12 (needs cudnn>=9.8).
+      # CPU torch has NO nvidia deps, so JAX owns the GPU/cuDNN cleanly. ---
+      - --extra-index-url https://download.pytorch.org/whl/cpu
+      - torch==2.5.1+cpu

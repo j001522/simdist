@@ -235,3 +235,6 @@ lighting_check/
 # regenerate on a login node rather than committing.
 assets/*.npz
 assets/*.safetensors
+
+# Local agent-tooling index, per-machine and not shared.
+.memsearch/
