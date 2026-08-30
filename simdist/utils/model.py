@@ -29,7 +29,14 @@ def load_model_from_ckpt(
     model_cfg = OmegaConf.to_container(model_cfg, resolve=True)
     dummy_scaler_params = make_dummy_scaler_params(model_cfg)
     model = models.get_model(model_cfg, dummy_scaler_params, nnx.Rngs(0))
-    graphdef, model_state = nnx.split(model)
+    # Match the SAVE-side filter (trainer.py: `nnx.state(model, nnx.Not(nnx.Intermediate))`).
+    # The 8 `debug_*` Intermediate scalars in encoders.py/models.py are deliberately not
+    # written to disk, so including them here makes the strict structure check fail and
+    # drops us into the lossy fallback below for every checkpoint written since they were
+    # added (2026-07-21, 027004f).
+    graphdef, model_state, intermediate_state = nnx.split(
+        model, nnx.Not(nnx.Intermediate), ...
+    )
 
     model_pure_dict = model_state.to_pure_dict()
     with ocp.CheckpointManager(
@@ -42,7 +49,7 @@ def load_model_from_ckpt(
                 step,
                 args=ocp.args.StandardRestore(item=model_pure_dict),
             )
-        except ValueError:
+        except ValueError as err:
             # The checkpoint was saved under a flax version whose nnx state tree
             # differs from the current one (e.g. attention rng streams nested as
             # `rngs.default.{count,key}` in flax 0.10.x vs `rngs.{count,key}` in
@@ -52,75 +59,102 @@ def load_model_from_ckpt(
             # the scaler params); leave freshly-initialised rng streams untouched
             # — they are re-seeded per run and do not affect deterministic
             # inference.
+            print(
+                f"WARNING: strict restore of {ckpt_dir} @ {step} failed "
+                f"({type(err).__name__}: {err}); falling back to path-matched copy."
+            )
             raw = mngr.restore(step, args=ocp.args.StandardRestore())
-            _copy_matching_leaves(model_pure_dict, raw)
+            n_copied, skipped = _copy_matching_leaves(model_pure_dict, raw)
+            print(f"  fallback copied {n_copied} leaves from disk.")
+            if skipped:
+                # A skipped leaf keeps its `nnx.Rngs(0)` random init, which is silent and
+                # ruins every downstream number. Never let that pass unnoticed.
+                raise RuntimeError(
+                    f"Checkpoint restore from {ckpt_dir} @ {step} is INCOMPLETE: "
+                    f"{sum(n for _, n in skipped)} on-disk leaves had no matching path in "
+                    f"the model state and were dropped, under: "
+                    f"{', '.join('/'.join(p) for p, _ in skipped[:12])}. "
+                    "Those parameters would have stayed randomly initialised."
+                ) from err
             restored_pure_dict = model_pure_dict
 
-    model_state.replace_by_pure_dict(restored_pure_dict)
-    model = nnx.merge(graphdef, model_state)
+    _replace_by_pure_dict(model_state, restored_pure_dict)
+    model = nnx.merge(graphdef, model_state, intermediate_state)
 
     return model, model_cfg, step
 
 
-_MISSING = object()
+def _replace_by_pure_dict(model_state: nnx.State, pure_dict: dict) -> None:
+    """``State.replace_by_pure_dict`` that tolerates TREE-VALUED Variables.
 
+    nnx's own version walks the pure dict and requires every path in it to be a leaf
+    path of the state. That breaks on a Variable whose *value* is a nested dict: the
+    DINOv2 backbone keeps its frozen weights as one ``FrozenParam(frozen_subtree)``
+    (dinov2.py -- deliberately, so `trainable_blocks=0` stays byte-identical to the
+    pre-fine-tuning layout), so the state has a single leaf at
+    ``encoder.dinov2.params`` while ``to_pure_dict()`` expands it into 223 paths.
+    Saving is symmetric (orbax flattens the dict on the way out), restoring is not,
+    and every DINOv2 checkpoint therefore failed to load with
+    "key in pure_dict not available in state: ('encoder', 'dinov2', 'params',
+    'embeddings', 'cls_token')".
 
-def _children(node):
-    """Child keys of a container node, or None if ``node`` is a leaf.
-
-    Repeated submodules (MLP ``layers``, ResNet ``layer1..4``, transformer blocks)
-    are LISTS in the model's pure dict but come back from a raw orbax restore as
-    DICTS keyed "0", "1", ... Both are containers and must be walked as such.
+    Driving the walk from the STATE's leaves instead of the pure dict's fixes it: a
+    leaf takes whatever the pure dict holds at its path, array or subtree. Paths
+    missing from the pure dict keep their freshly-initialised value, which is the same
+    tolerance ``_copy_matching_leaves`` relies on for rng streams.
     """
-    if isinstance(node, dict):
-        return list(node.keys())
-    if isinstance(node, (list, tuple)):
-        return list(range(len(node)))
-    return None
+    flat = nnx.to_flat_state(model_state)
+    for path, variable in flat:
+        value = pure_dict
+        for key in path:
+            if not isinstance(value, dict) or key not in value:
+                value = None
+                break
+            value = value[key]
+        if value is None:
+            continue
+        variable.set_value(jax.tree.map(jnp.asarray, value))
 
 
-def _get_child(node, k):
-    """Fetch child ``k`` from a dict or sequence, tolerating int/str key skew."""
-    if isinstance(node, dict):
-        if k in node:
-            return node[k]
-        alt = str(k) if isinstance(k, int) else (
-            int(k) if isinstance(k, str) and k.lstrip("-").isdigit() else None
-        )
-        return node[alt] if alt is not None and alt in node else _MISSING
-    if isinstance(node, (list, tuple)):
-        i = k if isinstance(k, int) else (
-            int(k) if isinstance(k, str) and k.lstrip("-").isdigit() else None
-        )
-        return node[i] if i is not None and -len(node) <= i < len(node) else _MISSING
-    return _MISSING
+def _copy_matching_leaves(
+    dst: dict, src: dict, _prefix: Tuple[str, ...] = ()
+) -> Tuple[int, list]:
+    """Recursively copy leaves from ``src`` into ``dst`` where the same nested path
+    exists in both. Leaves present only in ``dst`` keep their value. Returns
+    ``(n_copied, skipped)`` where ``skipped`` lists ``(path, n_leaves)`` for every
+    on-disk subtree that found no home -- the caller MUST treat that as an error, since
+    a skipped leaf silently keeps its random init.
 
-
-def _copy_matching_leaves(dst, src) -> None:
-    """Recursively copy leaves from ``src`` into ``dst`` where the same nested
-    path exists in both. Leaves present only in ``dst`` keep their value; leaves
-    present only in ``src`` are ignored.
-
-    Driven by ``dst``'s structure, since ``dst`` is what we are filling. It must
-    descend through lists as well as dicts: the previous dict-only version silently
-    skipped every subtree under a list -- which is the whole ResNet, every dynamics
-    block and every MLP -- restoring 38 of 402 leaves and leaving 99.7% of the model
-    at its random init, with no error raised.
+    Sequence indices do not survive the round trip with a consistent key type: orbax
+    hands back the children of a numbered container keyed by the STRINGS "0", "1", ...
+    while ``to_pure_dict()`` keys them by the INTS 0, 1, .... A plain ``k in dst`` test
+    therefore missed every numbered layer, which silently dropped the whole of
+    ``dynamics``/``policy``/``reward``. Match on ``str(k)``.
     """
-    keys = _children(dst)
-    if keys is None:
-        return
-    for k in keys:
-        sv = _get_child(src, k)
-        if sv is _MISSING:
+    lookup = {str(k): k for k in dst}
+    n_copied, skipped = 0, []
+    for k, v in src.items():
+        path = _prefix + (str(k),)
+        dk = lookup.get(str(k))
+        if dk is None:
+            skipped.append((path, _count_leaves(v)))
             continue
-        dv = _get_child(dst, k)
-        if dv is _MISSING:
-            continue
-        if _children(dv) is not None and _children(sv) is not None:
-            _copy_matching_leaves(dv, sv)
-        elif _children(dv) is None and _children(sv) is None:
-            dst[k] = jnp.asarray(sv)
+        if isinstance(v, dict) and isinstance(dst[dk], dict):
+            c, s = _copy_matching_leaves(dst[dk], v, path)
+            n_copied += c
+            skipped.extend(s)
+        elif not isinstance(v, dict) and not isinstance(dst[dk], dict):
+            dst[dk] = jnp.asarray(v)
+            n_copied += 1
+        else:
+            skipped.append((path, _count_leaves(v)))
+    return n_copied, skipped
+
+
+def _count_leaves(v) -> int:
+    if not isinstance(v, dict):
+        return 1
+    return sum(_count_leaves(x) for x in v.values())
 
 
 def make_dummy_scaler_params(cfg: dict):
@@ -143,7 +177,11 @@ def maybe_load_pretrained_encoder(model: nnx.Module, cfg: dict) -> None:
     model config asks for them (``model.encoder.extero_obs.resnet.pretrained ==
     "imagenet"``). No-op for models without a ResNet encoder (e.g. Go2). Kept out of
     ``__init__`` so model construction stays torch-free; only called for a freshly
-    created model, never when resuming (the checkpoint already holds the weights)."""
+    created model, never when resuming (the checkpoint already holds the weights).
+
+    The DINOv2 encoder does NOT go through here: it is frozen, so its weights are read
+    from the staged .npz inside ``DINOv2Backbone.__init__`` and there is no random-init
+    state to overwrite. This function early-returns for it (no ``resnet`` config key)."""
     enc_cfg = cfg["model"].get("encoder", {}) or {}
     resnet_cfg = (enc_cfg.get("extero_obs", {}) or {}).get("resnet", {}) or {}
     if resnet_cfg.get("pretrained") != "imagenet":
