@@ -45,7 +45,7 @@ def _num_envs(env_args: str):
     return json.loads(env_args)["sim_args"]["num_envs"]
 
 
-def _plan(inputs, drop_short):
+def _plan(inputs, drop_short, allow_env_mismatch=False):
     """Validate every input up front; never start writing a doomed merge."""
     env_args = None
     plan = []
@@ -60,10 +60,17 @@ def _plan(inputs, drop_short):
             if env_args is None:
                 env_args = ea
             elif _num_envs(ea) != _num_envs(env_args):
-                sys.exit(
+                msg = (
                     f"num_envs mismatch: {path} has {_num_envs(ea)}, "
-                    f"expected {_num_envs(env_args)} -- segments are not comparable"
+                    f"expected {_num_envs(env_args)}"
                 )
+                if not allow_env_mismatch:
+                    sys.exit(f"{msg} -- segments are not comparable")
+                # Cross-RUN merges (not chunk segments of one run) legitimately differ
+                # here: num_envs only sets how many episodes are collected in parallel,
+                # not what an episode contains. Everything downstream reads per-demo
+                # groups. Pass --allow-env-mismatch when you mean it.
+                print(f"  WARNING: {msg} -- allowed explicitly.")
             keys = _demo_keys(data)
             kept = [k for k in keys if int(data[k].attrs["num_samples"]) >= drop_short]
             steps = sum(int(data[k].attrs["num_samples"]) for k in kept)
@@ -110,6 +117,24 @@ def _merged_record_yaml(inputs, out_dir):
     rec["merged_from"] = [os.path.dirname(p) for p in inputs]
     rec["merged_seeds"] = seeds
 
+    # Segment 0's reset_types describe segment 0 only. On a cross-run merge the inputs
+    # deliberately differ (e.g. GraspedAboveTable + GraspedNearHole) and copying one of
+    # them silently mislabels two thirds of the file, so record the union and keep the
+    # per-input lists alongside it.
+    per_input = []
+    for p in inputs:
+        rp = os.path.join(os.path.dirname(p), "record.yaml")
+        seg = {}
+        if os.path.isfile(rp):
+            with open(rp) as f:
+                seg = yaml.safe_load(f) or {}
+        per_input.append(list((seg.get("simplify") or {}).get("reset_types") or []))
+    if len({tuple(x) for x in per_input}) > 1:
+        union = list(dict.fromkeys(t for lst in per_input for t in lst))
+        rec.setdefault("simplify", {})["reset_types"] = union
+        rec["merged_reset_types"] = per_input
+        print(f"  reset_types differ across inputs -> union {union}")
+
     dst = os.path.join(out_dir, "record.yaml")
     with open(dst, "w") as f:
         yaml.dump(rec, f, default_flow_style=False)
@@ -126,13 +151,17 @@ def main():
                     help="drop demos with num_samples < N (pass min_episode_length)")
     ap.add_argument("--dry-run", action="store_true",
                     help="validate and report the merge without writing")
+    ap.add_argument("--allow-env-mismatch", action="store_true",
+                    help="permit inputs recorded with different num_envs (cross-RUN "
+                         "merge, e.g. two collection campaigns with different reset "
+                         "distributions). Everything else must still match.")
     args = ap.parse_args()
 
     if os.path.exists(args.out) and not args.dry_run:
         sys.exit(f"refusing to overwrite existing {args.out}")
 
     print(f"Planning merge of {len(args.inputs)} segments:")
-    env_args, plan = _plan(args.inputs, args.drop_short)
+    env_args, plan = _plan(args.inputs, args.drop_short, args.allow_env_mismatch)
 
     total_demos = sum(len(p["keys"]) for p in plan)
     total_steps = sum(p["steps"] for p in plan)
