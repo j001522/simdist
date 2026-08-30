@@ -61,6 +61,15 @@ encoder:
     # separately rather than with one shared statistic. See ManipulationEncoder.
     feature_norm: blockwise
   action_layers: 0            # schema parity with quadruped encoder; encoder is action-free
+  # Proprio -> latent branch. null/"none" = the paper's raw concat (6 joint obs among
+  # 3x768=2304 image dims, ~0.26%); "image" gives proprio its own block the size of one
+  # camera embedding (384 under `cls`, 768 under `cls_mean`), i.e. it counts as an extra camera. An int sets the width
+  # directly. See ManipulationEncoder for why this is a dimension problem, not a scale one.
+  proprio_embed_dim: image
+  # layernorm (affine-free, on the PROJECTED block) keeps the balance the projection buys
+  # from being undone by the projection's own output scale; "none" keeps every dof of the
+  # 6-d input at the price of an unguaranteed scale match. Only valid with a projection.
+  proprio_norm: layernorm
   latent_layers: 2            # [TBD-schema] post-concat MLP -> z depth
 
 embedding:
