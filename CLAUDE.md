@@ -21,7 +21,7 @@ simdist/                         # Python package (installed editable: pip insta
        models.py                 # world model architectures
        encoders.py               # observation encoders
        resnet.py                 # ResNet-18 backbone (nnx port of torchvision weights)
-       dinov2.py                 # frozen DINOv2 backbone (wraps FlaxDinov2Model)
+       dinov2.py                 # DINOv2 backbone (wraps FlaxDinov2Model); frozen or partially fine-tuned
        modules.py losses.py types.py scaler.py
    data/
        data_recorder.py          # buffers rollouts to HDF5
@@ -160,7 +160,7 @@ python scripts/simulate_go2.py model.checkpoint=<checkpoint>
 
 `generate_data.yaml` mixes the expert (iter 4999) at 50% with non-expert iterations 0..2000 and applies bursty action corruption — important for world-model coverage.
 
-## Frozen DINOv2 encoder (branch `dinov2-frozen-encoder`)
+## DINOv2 encoder (frozen, or partially fine-tuned)
 
 Alternative image backbone for `ManipulationEncoder`, selected by config: put a `dinov2`
 block under `model.encoder.extero_obs` instead of `resnet`
@@ -202,9 +202,49 @@ python scripts/stage_dinov2_weights.py            # -> assets/dinov2-small-224.n
 ```
 
 The script self-verifies against the torch reference and exits non-zero on divergence.
-`assets/*.npz` is gitignored; regenerate rather than commit. Being frozen and
-LayerNorm-only, this backbone also makes train and eval bit-identical (`max|train-eval|
-= 0`), which removes the BatchNorm train/eval gap the ResNet had.
+`assets/*.npz` is gitignored; regenerate rather than commit. Being LayerNorm-only with all
+dropout rates at 0.0, this backbone makes train and eval bit-identical (`max|train-eval|
+= 0`) whether or not it is being fine-tuned, which removes the BatchNorm train/eval gap the
+ResNet had.
+
+### Partial fine-tuning (`trainable_blocks` / `lr_mult`)
+
+**Fine-tuning needed no port of DINOv2 to nnx.** `FlaxDinov2Model` is a linen
+`FlaxPreTrainedModel`, but we never use its variable management: its forward is a pure
+function of an externally supplied params dict (`self.module.apply({"params": params or
+self.params}, ...)`, `modeling_flax_dinov2.py:613`), and we already hold and pass those
+params. JAX differentiates straight through it, so this is only a question of which nnx
+Variable *class* holds which slice of the tree.
+
+`model.encoder.extero_obs.dinov2.trainable_blocks: K` adapts the last K of 12 blocks plus
+the final layernorm (K=4 → 7.10M of 21.6M backbone params). `lr_mult` gives the backbone a
+fraction of the head LR via `optax.multi_transform` in `trainer.py`. `trainable_blocks: 0`
+is byte-identical to the frozen branch and still restores frozen-run checkpoints; K>0 is a
+different state layout and deliberately cannot.
+
+Four things that are not obvious:
+
+1. **One Variable per TENSOR, not one Variable holding the subtree.** A tree-valued
+   Variable does not survive the transforms: under `nnx.jit` its value comes back as a
+   `State` (breaking `flatten_dict`), and under `optax.multi_transform` the masked group
+   comes back as a plain dict of `MaskedNode()` (breaking the `State` structure match).
+   Hence the flat `nnx.data({"a/b/c": BackboneParam(...)})` layout — a *bare* dict
+   attribute is treated as static and nnx refuses to put arrays in it.
+2. **Discriminative LR has to be in the optimizer.** Scaling the gradient inside the module
+   is a no-op: Adam normalizes by gradient RMS. At `lr_mult: 1.0` the ViT is destroyed
+   within a few hundred steps.
+3. **No `stop_gradient` at the frozen/trainable boundary** — impossible (`module.apply`
+   runs all 12 blocks in one call) and unnecessary. JAX's partial evaluation classifies the
+   frozen prefix as primal-only and stages no backward residuals for it.
+4. **Memory scales ~linearly in K, and the batch is the multiplier.** `encode_latent` runs
+   on `batch * n_cam` images. Measured backward temps: at batch 256 (768 images) K=4 needs
+   ~40 GiB, K=2 ~20 GiB; halved at batch 128. Snellius H100 is 95,830 MiB. The forward-only
+   target encode in `WorldModelLoss` is under `stop_gradient` and does not add to this.
+
+Launcher: `train_wm_manip_dino_ft.sbatch` (batch 128, 36 h, `eval_interval` and
+`keep_period` doubled to keep the per-epoch eval cadence of the frozen sweep). Keep
+`train_wm_manip_dino.sbatch` intact as the frozen baseline. Note the fine-tuned runs are
+**not batch-matched** to that baseline.
 
 ## Adapting to AIC (UR5e cable insertion)
 

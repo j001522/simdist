@@ -164,10 +164,11 @@ class ManipulationEncoder(WorldModelEncoderBase):
             npz = paths.resolve_asset_path(dino_cfg["weights"])
             self.dinov2 = dinov2_mod.get_dinov2_backbone(dino_cfg, h, npz)
             self.resnet = None
-            # Always frozen: the point of this branch. Weights are FrozenParam, so the
-            # optimizer never sees them (see dinov2.py) -- this flag only drives the
-            # explicit stop_gradient in encode_latent.
-            self.freeze_resnet = True
+            # Frozen unless `dinov2.trainable_blocks > 0`. When frozen the weights are
+            # FrozenParam and the optimizer never sees them (see dinov2.py), so this flag
+            # only drives the extra stop_gradient below; when fine-tuning it must be off
+            # or that stop_gradient would sever the very gradient we are adding.
+            self.freeze_resnet = self.dinov2.trainable_blocks == 0
             self.per_image_embed_dim = self.dinov2.out_features
         else:
             resnet_cfg = extero_cfg["resnet"]
